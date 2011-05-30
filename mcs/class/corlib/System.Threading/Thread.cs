@@ -52,7 +52,7 @@ namespace System.Threading {
 
 		/* Note this is an opaque object (an array), not a CultureInfo */
 		private object cached_culture_info; /*FIXME remove this on the next corlib version bump*/
-		private IntPtr unused0;
+		private IntPtr free_park_spot_list;
 		internal bool threadpool_thread;
 		/* accessed only from unmanaged code */
 		private IntPtr name;

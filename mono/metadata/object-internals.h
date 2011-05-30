@@ -371,7 +371,7 @@ struct _MonoInternalThread {
 	volatile int lock_thread_id; /* to be used as the pre-shifted thread id in thin locks. Used for appdomain_ref push/pop */
 	HANDLE	    handle;
 	MonoArray  *cached_culture_info;
-	gpointer    unused1;
+	void *free_park_spot_list; /*This is a ParkSpot* */
 	MonoBoolean threadpool_thread;
 	gunichar2  *name;
 	guint32	    name_len;

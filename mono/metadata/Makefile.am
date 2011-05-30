@@ -169,6 +169,8 @@ libmonoruntime_la_SOURCES = \
 	opcodes.c		\
 	socket-io.c		\
 	socket-io.h		\
+	parkspot.c	\
+	parkspot.h	\
 	process.c		\
 	process.h		\
 	profiler.c		\

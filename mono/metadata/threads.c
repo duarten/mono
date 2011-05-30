@@ -5,6 +5,7 @@
  *	Dick Porter (dick@ximian.com)
  *	Paolo Molaro (lupus@ximian.com)
  *	Patrik Torstensson (patrik.torstensson@labs2.com)
+ *	Duarte Nunes (duarte.m.nunes@gmail.com)
  *
  * Copyright 2001-2003 Ximian, Inc (http://www.ximian.com)
  * Copyright 2004-2009 Novell, Inc (http://www.novell.com)
@@ -25,6 +26,7 @@
 #include <mono/metadata/domain-internals.h>
 #include <mono/metadata/profiler-private.h>
 #include <mono/metadata/threads.h>
+#include <mono/metadata/parkspot.h>
 #include <mono/metadata/threadpool.h>
 #include <mono/metadata/threads-types.h>
 #include <mono/metadata/exception.h>
@@ -191,6 +193,8 @@ static void abort_thread_internal (MonoInternalThread *thread, gboolean can_rais
 static void suspend_thread_internal (MonoInternalThread *thread, gboolean interrupt);
 static void self_suspend_internal (MonoInternalThread *thread);
 static gboolean resume_thread_internal (MonoInternalThread *thread);
+
+static inline void cleanup_park_spot_list (ParkSpot *head);
 
 static MonoException* mono_thread_execute_interruption (MonoInternalThread *thread);
 static void ref_stack_destroy (gpointer rs);
@@ -384,6 +388,8 @@ static void thread_cleanup (MonoInternalThread *thread)
 	thread->static_data = NULL;
 	ref_stack_destroy (thread->appdomain_refs);
 	thread->appdomain_refs = NULL;
+
+	cleanup_park_spot_list ((ParkSpot *)&thread->free_park_spot_list);
 
 	if (mono_thread_cleanup_fn)
 		mono_thread_cleanup_fn (thread);
@@ -4595,4 +4601,149 @@ resume_thread_internal (MonoInternalThread *thread)
 	thread->state &= ~ThreadState_Suspended;
 	LeaveCriticalSection (thread->synch_cs);
 	return TRUE;
+}
+
+/*
+ * The ParkSpot API. It is only safe to call through the Parker object.
+ */
+
+static inline void 
+cleanup_park_spot_list (ParkSpot *head)
+{
+    while (head != NULL) {
+        ParkSpot *next = head->next;
+        mono_gc_free_fixed(head);
+        head = next;
+    }
+}
+
+gpointer 
+ves_icall_System_Threading_ParkSpot_Alloc_internal (void) 
+{    
+    ParkSpot *ps;
+    MonoInternalThread *thread = mono_thread_internal_current();
+
+    if ((ps = (ParkSpot *) thread->free_park_spot_list) != NULL) {
+        thread->free_park_spot_list = ps->next;
+    } else {
+        ps = (ParkSpot *) mono_gc_alloc_fixed(sizeof(*ps), NULL);
+        ps->thread = thread;
+        MONO_SEM_INIT(&ps->handle, 0);
+    }
+
+    ps->state = 0;
+    return ps;
+}
+
+void 
+ves_icall_System_Threading_ParkSpot_Free_internal (ParkSpot *ps) 
+{
+    MonoInternalThread *thread = ps->thread;
+    ps->next = (ParkSpot *) thread->free_park_spot_list;
+    thread->free_park_spot_list = ps;
+}
+
+void 
+ves_icall_System_Threading_ParkSpot_Set_internal (ParkSpot *ps) 
+{
+    /*
+     * We consider the case where a thread executing an interruption
+     * satisfies some previous wait it was in the middle of.
+     */
+
+    if (ps->thread == mono_thread_internal_current()) {
+        ps->state = 1;
+    } else {
+        park_spot_set_os_aware(ps);
+    }
+}
+
+static inline void 
+respond_to_interrupt_request (MonoInternalThread *thread, gboolean clr_state) {
+    if (thread->thread_interrupt_requested) {
+        if (clr_state) {
+            mono_thread_clr_state(thread, ThreadState_WaitSleepJoin);
+        }
+
+        mono_thread_interruption_checkpoint();
+
+        /*
+         * Recheck because the thread may also have been suspended,
+         * which is checked first in mono_thread_execute_interruption.
+         */
+
+        mono_thread_current_check_pending_interrupt();
+        g_assert_not_reached();
+    }
+}
+
+gint32 
+wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed) 
+{
+    guint32 result;      
+    MonoInternalThread *thread = ps->thread;
+    int last_time = (timeout != INFINITE) ? mono_msec_ticks() : 0;
+
+    do {         
+        if (ps->state != 0) {
+            return WAIT_OBJECT_0;
+        }
+
+        if (timeout == 0) {
+            return WAIT_TIMEOUT;
+        }
+        
+        respond_to_interrupt_request(thread, FALSE);
+
+        if (managed) {
+            mono_thread_set_state(thread, ThreadState_WaitSleepJoin);
+        }
+
+        /*
+         * Recheck since an interrupt request may have come in just 
+         * before setting the state to WaitSleepJoin.
+         */
+
+        respond_to_interrupt_request(thread, managed);
+
+        if (thread->thread_interrupt_requested) {
+            if (managed) {
+                mono_thread_set_state(thread, ThreadState_WaitSleepJoin);
+            }
+            mono_thread_interruption_checkpoint();
+
+        }
+
+        /*
+         * Perfom the wait using some OS aware mechanism.
+         */
+
+        result = park_spot_wait_os_aware(ps, timeout);
+
+        if (managed) {
+            mono_thread_clr_state(thread, ThreadState_WaitSleepJoin);
+        }
+
+        if (result != WAIT_IO_COMPLETION) {
+            return result;
+        }
+
+        mono_thread_interruption_checkpoint();
+
+        if (ps->state == 0 && timeout != INFINITE) {
+            int now = mono_msec_ticks();
+            int elapsed = (now == last_time) ? 1 : now - last_time;
+            if (elapsed < timeout)
+                timeout -= elapsed;
+            else
+                timeout = 0;
+            last_time = now;
+        }
+    } while (TRUE);
+}
+
+gint32 
+ves_icall_System_Threading_ParkSpot_Wait_internal (ParkSpot *ps, int timeout)
+{
+    return wait_for_park_spot(ps, timeout, TRUE);
 }

@@ -1505,6 +1505,7 @@
    <Compile Include="System.Text\UTF8Encoding.cs" />
    <Compile Include="System.Text\UTF32Encoding.cs" />
    <Compile Include="System.Threading\AbandonedMutexException.cs" />
+	 <Compile Include="System.Threading\Alerter.cs" />
    <Compile Include="System.Threading\ApartmentState.cs" />
    <Compile Include="System.Threading\AsyncFlowControl.cs" />
    <Compile Include="System.Threading\AutoResetEvent.cs" />
@@ -1528,6 +1529,8 @@
    <Compile Include="System.Threading\NativeOverlapped.cs" />
    <Compile Include="System.Threading\Overlapped.cs" />
    <Compile Include="System.Threading\ParameterizedThreadStart.cs" />
+	 <Compile Include="System.Threading\Parker.cs" />
+	 <Compile Include="System.Threading\ParkSpot.cs" />
    <Compile Include="System.Threading\ReaderWriterLock.cs" />
    <Compile Include="System.Threading\RegisteredWaitHandle.cs" />
    <Compile Include="System.Threading\SendOrPostCallback.cs" />

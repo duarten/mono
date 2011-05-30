@@ -850,6 +850,12 @@ ICALL(NATIVEC_3, "OpenEvent_internal(string,System.Security.AccessControl.EventW
 ICALL(NATIVEC_4, "ResetEvent_internal",  ves_icall_System_Threading_Events_ResetEvent_internal)
 ICALL(NATIVEC_5, "SetEvent_internal",    ves_icall_System_Threading_Events_SetEvent_internal)
 
+ICALL_TYPE(PARKSPOT, "System.Threading.ParkSpot", PARKSPOT_1)
+ICALL(PARKSPOT_1, "Alloc", ves_icall_System_Threading_ParkSpot_Alloc_internal)
+ICALL(PARKSPOT_2, "Free", ves_icall_System_Threading_ParkSpot_Free_internal)
+ICALL(PARKSPOT_3, "Set", ves_icall_System_Threading_ParkSpot_Set_internal)
+ICALL(PARKSPOT_4, "Wait", ves_icall_System_Threading_ParkSpot_Wait_internal)
+
 ICALL_TYPE(SEMA, "System.Threading.Semaphore", SEMA_1)
 ICALL(SEMA_1, "CreateSemaphore_internal(int,int,string,bool&)", ves_icall_System_Threading_Semaphore_CreateSemaphore_internal)
 ICALL(SEMA_2, "OpenSemaphore_internal(string,System.Security.AccessControl.SemaphoreRights,System.IO.MonoIOError&)", ves_icall_System_Threading_Semaphore_OpenSemaphore_internal)
