@@ -26,7 +26,7 @@ namespace System.Threading {
 
         private readonly IntPtr ps;
 
-        internal ParkSpot() {
+        internal void Alloc() {
             ps = Alloc_internal();
         }
 

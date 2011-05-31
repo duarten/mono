@@ -233,7 +233,7 @@ namespace System.Threading {
             // Allocate a park spot to block the current thread.
             //
 
-            parkSpot = ParkSpot.Alloc();
+            parkSpot.Alloc();
 
             //
             // Try to clear the wait-in-progress bit. If the bit was already
@@ -242,7 +242,7 @@ namespace System.Threading {
             //
 
             if (!TestAndClearInProgress()) {
-                parkSpot.Free();
+                parkSpot.Dispose();
                 return waitStatus;
             }
 
@@ -262,7 +262,7 @@ namespace System.Threading {
                     //
 
                     if (TryCancel()) {
-                        parkSpot.Free();
+                        parkSpot.Dispose();
                         return StParkStatus.Alerted;
                     }
 
@@ -287,7 +287,7 @@ namespace System.Threading {
             // alerter, if it was registered.
             //
 
-            parkSpot.Free();
+            parkSpot.Dispose();
             if (unregister) {
                 cargs.Alerter.DeregisterParker(this);
             }
