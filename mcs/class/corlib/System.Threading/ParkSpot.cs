@@ -97,15 +97,15 @@ namespace System.Threading
         }
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static IntPtr Alloc_internal ();
+		private static extern IntPtr Alloc_internal ();
         
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static void Free_internal (IntPtr ps);
+		private static extern void Free_internal (IntPtr ps);
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static void Set_internal (IntPtr ps);
+		private static extern void Set_internal (IntPtr ps);
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static bool Wait_internal (IntPtr ps, int timeout);
+		private static extern bool Wait_internal (IntPtr ps, int timeout);
     }
 }
