@@ -1,3 +1,6 @@
+//
+// System.Threading.Parker.cs
+//
 // Copyright 2011 Carlos Martins, Duarte Nunes
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +19,14 @@
 //
 
 using System;
-using System.Threading;
 
 #pragma warning disable 0420
 
-namespace System.Threading {
+namespace System.Threading 
+{
 
-    public class StParker {
+    public class StParker 
+		{
 
         //
         // Constants.
@@ -61,36 +65,41 @@ namespace System.Threading {
         // Constructors.
         //
 
-        public StParker(int releasers) {
+        public StParker(int releasers) 
+				{
             state = releasers | WAIT_IN_PROGRESS;
         }
 
-        public StParker() : this(1) { }
+        public StParker () 
+					: this (1) { }
 
         //
         // Resets the parker.
         //
 
-        public void Reset(int releasers) {
+        public void Reset (int releasers) 
+				{
             pnext = null;
             state = releasers | WAIT_IN_PROGRESS;
         }
 
-        public void Reset() {
-            Reset(1);
+        public void Reset () 
+				{
+            Reset (1);
         }
 
         //
         // Tests and clears the wait-in-progress bit.
         //
 
-        internal bool TestAndClearInProgress() {
+        internal bool TestAndClearInProgress () 
+				{
             do {
                 int s;
                 if ((s = state) >= 0) {
                     return false;
                 }
-                if (Interlocked.CompareExchange(ref state, (s & ~WAIT_IN_PROGRESS), s) == s) {
+                if (Interlocked.CompareExchange (ref state, (s & ~WAIT_IN_PROGRESS), s) == s) {
                     return true;
                 }
             } while (true);
@@ -108,7 +117,8 @@ namespace System.Threading {
         // Tries to lock the parker.
         //
 
-        public bool TryLock() {
+        public bool TryLock () 
+				{
             do {
 
                 //
@@ -124,7 +134,7 @@ namespace System.Threading {
                 // Try to decrement the count down lock.
                 //
 
-                if (Interlocked.CompareExchange(ref state, s - 1, s) == s) {
+                if (Interlocked.CompareExchange (ref state, s - 1, s) == s) {
 
                     //
                     // Return true if the count down lock reached zero.
@@ -139,7 +149,8 @@ namespace System.Threading {
         // Tries to cancel the parker.
         //
 
-        public bool TryCancel() {
+        public bool TryCancel () 
+				{
             do {
 
                 //
@@ -156,7 +167,7 @@ namespace System.Threading {
                 // the wait-in-progress bit. Return true on success. 
                 //
 
-                if (Interlocked.CompareExchange(ref state, (s & WAIT_IN_PROGRESS), s) == s) {
+                if (Interlocked.CompareExchange (ref state, (s & WAIT_IN_PROGRESS), s) == s) {
                     return true;
                 }
             } while (true);
@@ -169,7 +180,8 @@ namespace System.Threading {
         //       owner thread.
         //
 
-        public void SelfCancel() {
+        public void SelfCancel () 
+				{
             state = WAIT_IN_PROGRESS;
         }
 
@@ -177,29 +189,32 @@ namespace System.Threading {
         // Unparks the parker's owner thread if the wait is still in progress.
         //
 
-        public bool UnparkInProgress(int ws) {
+        public bool UnparkInProgress (int ws) 
+				{
             waitStatus = ws;
             return (state & WAIT_IN_PROGRESS) != 0 &&
-                   (Interlocked.Exchange(ref state, 0) & WAIT_IN_PROGRESS) != 0;
+                   (Interlocked.Exchange (ref state, 0) & WAIT_IN_PROGRESS) != 0;
         }
 
         //
         // Unparks the parker owner thread.
         //
 
-        public void Unpark(int status) {
-            if (UnparkInProgress(status)) {
+        public void Unpark (int status) 
+				{
+            if (UnparkInProgress (status)) {
                 return;
             }
 
-            parkSpot.Set();
+            parkSpot.Set ();
         }
 
         //
         // Unparks the parker's owner thread.
         //
 
-        public void UnparkSelf(int status) {
+        public void UnparkSelf (int status) 
+				{
             waitStatus = status;
             state = 0;
         }
@@ -209,8 +224,12 @@ namespace System.Threading {
         // specified cancellers and spinning if specified.
         //
 
-        public int Park(int spinCount, StCancelArgs cargs) {
-
+        public int Park (int spinCount, StCancelArgs cargs) 
+				{
+#if NET_4_0 
+						SpinWait spinWait;
+#endif
+						
             //
             // Spin the specified number of cycles before blocking
             // the current thread.
@@ -220,20 +239,24 @@ namespace System.Threading {
                 if (state == 0) {
                     return waitStatus;
                 }
-                if (cargs.Alerter != null && cargs.Alerter.IsSet && TryCancel()) {
+                if (cargs.Alerter != null && cargs.Alerter.IsSet && TryCancel ()) {
                     return StParkStatus.Alerted;
                 }
                 if (spinCount-- <= 0) {
                     break;
                 }
-                Platform.SpinWait(1);
+#if NET_4_0 								
+                spinWait.SpinOnce ();
+#else
+								Thread.SpinWait (1);
+#endif								
             } while (true);
 
             //
             // Allocate a park spot to block the current thread.
             //
 
-            parkSpot.Alloc();
+            parkSpot.Alloc ();
 
             //
             // Try to clear the wait-in-progress bit. If the bit was already
@@ -241,8 +264,8 @@ namespace System.Threading {
             // return the wait status.
             //
 
-            if (!TestAndClearInProgress()) {
-                parkSpot.Dispose();
+            if (!TestAndClearInProgress ()) {
+                parkSpot.Free ();
                 return waitStatus;
             }
 
@@ -253,7 +276,7 @@ namespace System.Threading {
 
             bool unregister = false;
             if (cargs.Alerter != null) {
-                if (!(unregister = cargs.Alerter.RegisterParker(this))) {
+                if (!(unregister = cargs.Alerter.RegisterParker (this))) {
 
                     //
                     // The alerter is already set. So, we try to cancel the
@@ -261,8 +284,8 @@ namespace System.Threading {
                     // return an alerted wait status.
                     //
 
-                    if (TryCancel()) {
-                        parkSpot.Dispose();
+                    if (TryCancel ()) {
+                        parkSpot.Free ();
                         return StParkStatus.Alerted;
                     }
 
@@ -272,7 +295,7 @@ namespace System.Threading {
                     // the park spot until it is set.
                     //
 
-                    cargs.ResetImplicitCancellers();
+                    cargs.ResetImplicitCancellers ();
                 }
             }
 
@@ -280,27 +303,29 @@ namespace System.Threading {
             // Wait on the park spot.
             //
 
-            parkSpot.Wait(this, cargs);
+            parkSpot.Wait (this, cargs);
 
             //
             // Free the park spot and deregister the parker from the
             // alerter, if it was registered.
             //
 
-            parkSpot.Dispose();
+            parkSpot.Free ();
             if (unregister) {
-                cargs.Alerter.DeregisterParker(this);
+                cargs.Alerter.DeregisterParker (this);
             }
             return waitStatus;
         }
 
-        public int Park(StCancelArgs cargs) {
-            return Park(0, cargs);
+        public int Park (StCancelArgs cargs) 
+				{
+            return Park (0, cargs);
         }
 
 
-        public int Park() {
-            return Park(0, StCancelArgs.None);
+        public int Park () 
+				{
+            return Park (0, StCancelArgs.None);
         }
 
         //
@@ -308,10 +333,10 @@ namespace System.Threading {
         // the specified cancellers.
         //
 
-        public static int Sleep(StCancelArgs cargs) {
-            StParker pk = new StParker();
-            int ws = pk.Park(0, cargs);
-            StCancelArgs.ThrowIfException(ws);
+        public static int Sleep (StCancelArgs cargs) {
+            StParker pk = new StParker ();
+            int ws = pk.Park (0, cargs);
+            StCancelArgs.ThrowIfException (ws);
             return ws;
         }
 
@@ -319,9 +344,10 @@ namespace System.Threading {
         // CASes on the *pnext* field.
         //
 
-        internal bool CasNext(StParker n, StParker nn) {
+        internal bool CasNext (StParker n, StParker nn) 
+				{
             return (pnext == n &&
-                    Interlocked.CompareExchange(ref pnext, nn, n) == n);
+                    Interlocked.CompareExchange (ref pnext, nn, n) == n);
         }
     }
 
@@ -329,7 +355,9 @@ namespace System.Threading {
     // This class implements a parker that is used as sentinel.
     //
     
-    public class SentinelParker : StParker {
-        public SentinelParker() : base(0) { }
+    public class SentinelParker : StParker 
+		{
+        public SentinelParker () 
+					: base(0) { }
     }
 }

@@ -1,7 +1,7 @@
 //
 // System.Threading.ParkSpot.cs
 //
-// Copyright 2011 Carlos Martins, Duarte Nunes
+// Copyright 2011 Duarte Nunes
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,38 +20,44 @@
 
 using System.Runtime.CompilerServices;
 
-namespace System.Threading {
+namespace System.Threading 
+{
 
-	internal struct ParkSpot {
+	internal struct ParkSpot 
+	{
+        private IntPtr ps;
 
-        private readonly IntPtr ps;
-
-        internal void Alloc() {
-            ps = Alloc_internal();
+        internal void Alloc () 
+				{
+            ps = Alloc_internal ();
         }
 
-        internal void Dispose() {
-            Free_internal(ps);
+        internal void Free () 
+				{
+            Free_internal (ps);
         }
 
-        internal void Set() {
-            Set_internal(ps);
+        internal void Set () 
+				{
+            Set_internal (ps);
         }
 
-        internal int Wait(StParker parker, int timeout) {
+        internal void Wait (StParker pk, StCancelArgs cargs) 
+				{
             int ws;
             bool interrupted = false;
             do {
                 try {
-                    ws = Wait_internal(cargs.Timeout) ? StParkStatus.Success
-                                                      : StParkStatus.Timeout;
+                    ws = Wait_internal (ps, cargs.Timeout) 
+											 ? StParkStatus.Success
+                       : StParkStatus.Timeout;
                     break;
                 } catch (ThreadInterruptedException) {
-                    interrupted = true;
                     if (cargs.Interruptible) {
                         ws = StParkStatus.Interrupted;
                         break;
                     }
+										interrupted = true;
                 }
             } while (true);
 
@@ -65,9 +71,13 @@ namespace System.Threading {
                 if (pk.TryCancel()) {
                     pk.UnparkSelf(ws);
                 } else {
+										if (ws == StParkStatus.Interrupted)  {
+										    interrupted = true;
+										}
+										
                     do {
                         try {
-                            Wait_internal(INFINITE);
+                            Wait_internal (ps, Timeout.Infinite);
                             break;
                         } catch (ThreadInterruptedException) {
                             interrupted = true;
@@ -82,20 +92,20 @@ namespace System.Threading {
             //
 
             if (interrupted) {
-                Thread.CurrentThread.Interrupt();
+                Thread.CurrentThread.Interrupt ();
             }
         }
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-		private extern static IntPtr Alloc_internal();
+				private extern static IntPtr Alloc_internal ();
         
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-		private extern static void Free_internal(IntPtr ps);
+				private extern static void Free_internal (IntPtr ps);
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-		private extern static void Set_internal(IntPtr ps);
+				private extern static void Set_internal (IntPtr ps);
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-		private extern static int Wait_internal(IntPtr ps, int timeout);
+				private extern static bool Wait_internal (IntPtr ps, int timeout);
     }
 }

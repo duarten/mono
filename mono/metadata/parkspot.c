@@ -10,11 +10,11 @@
 void 
 park_spot_set_os_aware (ParkSpot *ps) 
 {
-    mono_sem_post(&ps->handle);
+    mono_sem_post (&ps->handle);
 }
 
 gint32 
 park_spot_wait_os_aware (ParkSpot *ps, int timeout) 
 {
-    return mono_sem_timedwait(&ps->handle, timeout, TRUE);
+    return mono_sem_timedwait (&ps->handle, timeout, TRUE);
 }

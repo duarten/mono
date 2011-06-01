@@ -15,7 +15,7 @@
 #include <mono/metadata/threads-types.h>
 
 /*
- * TODO:
+ * FIXME:
  *  Use specialized park spots depending on the underlying OS and
  *  if shared memory is enabled (e.g., futexes on linux w/o shm).
  */
@@ -39,9 +39,9 @@ typedef struct _ParkSpot {
 gpointer ves_icall_System_Threading_ParkSpot_Alloc_internal (void) MONO_INTERNAL;
 void ves_icall_System_Threading_ParkSpot_Free_internal (ParkSpot *ps) MONO_INTERNAL;
 void ves_icall_System_Threading_ParkSpot_Set_internal (ParkSpot *ps) MONO_INTERNAL;
-gint32 ves_icall_System_Threading_ParkSpot_Wait_internal (ParkSpot *ps, int timeout) MONO_INTERNAL;
+gboolean ves_icall_System_Threading_ParkSpot_Wait_internal (ParkSpot *ps, int timeout) MONO_INTERNAL;
 
-gint32 wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed) MONO_INTERNAL;
+gboolean wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed) MONO_INTERNAL;
 
 void park_spot_set_os_aware (ParkSpot *ps) MONO_INTERNAL;
 gint32 park_spot_wait_os_aware (ParkSpot *ps, int timeout) MONO_INTERNAL;

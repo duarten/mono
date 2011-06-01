@@ -1509,6 +1509,7 @@
    <Compile Include="System.Threading\ApartmentState.cs" />
    <Compile Include="System.Threading\AsyncFlowControl.cs" />
    <Compile Include="System.Threading\AutoResetEvent.cs" />
+	 <Compile Include="System.Threading\CancelArgs.cs" />
    <Compile Include="System.Threading\CompressedStack.cs" />
    <Compile Include="System.Threading\ContextCallback.cs" />
    <Compile Include="System.Threading\EventResetMode.cs" />
@@ -1531,6 +1532,7 @@
    <Compile Include="System.Threading\ParameterizedThreadStart.cs" />
 	 <Compile Include="System.Threading\Parker.cs" />
 	 <Compile Include="System.Threading\ParkSpot.cs" />
+	 <Compile Include="System.Threading\ParkStatus.cs" />
    <Compile Include="System.Threading\ReaderWriterLock.cs" />
    <Compile Include="System.Threading\RegisteredWaitHandle.cs" />
    <Compile Include="System.Threading\SendOrPostCallback.cs" />

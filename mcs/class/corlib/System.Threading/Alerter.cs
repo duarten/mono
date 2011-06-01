@@ -1,3 +1,6 @@
+//
+// System.Threading.Alerter.cs
+//
 // Copyright 2011 Carlos Martins, Duarte Nunes
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +19,25 @@
 //
 
 using System;
-using System.Threading;
 
 #pragma warning disable 0420
 
-namespace System.Threading {
-    
-    public class StAlerter {
+namespace System.Threading 
+{
+		public class StThreadAlertedException : SystemException 
+		{
+				public StThreadAlertedException () 
+					: base ("Wait alerted") { }
+
+        public StThreadAlertedException (string msg) 
+					: base (msg) { }
+
+        public StThreadAlertedException (string msg, Exception innerEx) 
+					: base (msg, innerEx) {}
+    }
+		
+    public class StAlerter 
+		{
 
         //
         // The state of the alerter is a non-blocking stack that links
@@ -30,12 +45,14 @@ namespace System.Threading {
         // is set, its state holds the ALERTED reference.
         //
 
-        internal static StParker ALERTED = new StParker();
+        internal static StParker ALERTED = new StParker ();
         internal volatile StParker state;
 
-        public StAlerter() {}
+        public StAlerter () 
+				{ }
 
-        internal StAlerter(bool alerted) {
+        internal StAlerter (bool alerted) 
+				{
             state = alerted ? ALERTED : null;
         }
 
@@ -51,7 +68,8 @@ namespace System.Threading {
         // Registers the specified parker with the alerter.
         //
 
-        internal bool RegisterParker(StParker pk) {
+        internal bool RegisterParker (StParker pk) 
+				{
             do {
                 StParker s;
 
@@ -68,7 +86,7 @@ namespace System.Threading {
                 //
 
                 pk.pnext = s;
-                if (Interlocked.CompareExchange(ref state, pk, s) == s) {
+                if (Interlocked.CompareExchange (ref state, pk, s) == s) {
                     return true;
                 }
             } while (true);
@@ -79,7 +97,8 @@ namespace System.Threading {
         // parker in the alerter list.
         //
 
-        private void SlowDeregisterParker(StParker pk) {
+        private void SlowDeregisterParker (StParker pk) 
+				{
             
             //
             // Absorb the locked parkers at top of the stack.
@@ -110,7 +129,7 @@ namespace System.Threading {
             while (p != null && p != past) {
                 StParker n = p.pnext;
                 if (n != null && n.IsLocked) {
-                    p.CasNext(n, n.pnext);
+                    p.CasNext (n, n.pnext);
                 } else {
                     p = n;
                 }
@@ -121,7 +140,8 @@ namespace System.Threading {
         // Deregisters the specified parker from the alerter.
         //
 
-        internal void DeregisterParker(StParker pk) {
+        internal void DeregisterParker (StParker pk) 
+				{
 
             //
             // Very often there is only a parker inserted in the alerter
@@ -129,17 +149,18 @@ namespace System.Threading {
             //
             
             if (pk.pnext == null &&
-                Interlocked.CompareExchange(ref state, null, pk) == pk) {
+                Interlocked.CompareExchange (ref state, null, pk) == pk) {
                 return;
             }
-            SlowDeregisterParker(pk);
+            SlowDeregisterParker (pk);
         }
 
         //  
         // Sets the alerter.
         //
 
-        public bool Set() {
+        public bool Set () 
+				{
             do {
                 StParker s;
                 if ((s = state) == ALERTED) {
@@ -151,10 +172,10 @@ namespace System.Threading {
                 // all parkers registered with the alerter.
                 //
 
-                if (Interlocked.CompareExchange(ref state, ALERTED, s) == s) {
+                if (Interlocked.CompareExchange (ref state, ALERTED, s) == s) {
                     while (s != null) {
-                        if (s.TryCancel()) {
-                            s.Unpark(StParkStatus.Alerted);
+                        if (s.TryCancel ()) {
+                            s.Unpark (StParkStatus.Alerted);
                         }
                         s = s.pnext;
                     }

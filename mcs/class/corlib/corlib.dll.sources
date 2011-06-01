@@ -1462,9 +1462,11 @@ System.Text/UTF7Encoding.cs
 System.Text/UTF8Encoding.cs
 System.Text/UTF32Encoding.cs
 System.Threading/AbandonedMutexException.cs
+System.Threading/Alerter.cs
 System.Threading/ApartmentState.cs
 System.Threading/AsyncFlowControl.cs
 System.Threading/AutoResetEvent.cs
+System.Threading/CancelArgs.cs
 System.Threading/CompressedStack.cs
 System.Threading/ContextCallback.cs
 System.Threading/EventResetMode.cs
@@ -1485,6 +1487,9 @@ System.Threading/NativeEventCalls.cs
 System.Threading/NativeOverlapped.cs
 System.Threading/Overlapped.cs
 System.Threading/ParameterizedThreadStart.cs
+System.Threading/Parker.cs
+System.Threading/ParkSpot.cs
+System.Threading/ParkStatus.cs
 System.Threading/ReaderWriterLock.cs
 System.Threading/RegisteredWaitHandle.cs
 System.Threading/SendOrPostCallback.cs

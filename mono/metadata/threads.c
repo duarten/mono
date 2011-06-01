@@ -389,7 +389,7 @@ static void thread_cleanup (MonoInternalThread *thread)
 	ref_stack_destroy (thread->appdomain_refs);
 	thread->appdomain_refs = NULL;
 
-	cleanup_park_spot_list ((ParkSpot *)&thread->free_park_spot_list);
+	cleanup_park_spot_list ((ParkSpot *) &thread->free_park_spot_list);
 
 	if (mono_thread_cleanup_fn)
 		mono_thread_cleanup_fn (thread);
@@ -4612,7 +4612,7 @@ cleanup_park_spot_list (ParkSpot *head)
 {
     while (head != NULL) {
         ParkSpot *next = head->next;
-        mono_gc_free_fixed(head);
+        mono_gc_free_fixed (head);
         head = next;
     }
 }
@@ -4621,14 +4621,15 @@ gpointer
 ves_icall_System_Threading_ParkSpot_Alloc_internal (void) 
 {    
     ParkSpot *ps;
-    MonoInternalThread *thread = mono_thread_internal_current();
+    MonoInternalThread *thread = mono_thread_internal_current ();
 
     if ((ps = (ParkSpot *) thread->free_park_spot_list) != NULL) {
         thread->free_park_spot_list = ps->next;
     } else {
-        ps = (ParkSpot *) mono_gc_alloc_fixed(sizeof(*ps), NULL);
+        ps = (ParkSpot *) mono_gc_alloc_fixed (sizeof (*ps), NULL);
         ps->thread = thread;
-        MONO_SEM_INIT(&ps->handle, 0);
+				//FIXME: Initialize OS dependent blocking mechanism somewhere else.
+        MONO_SEM_INIT (&ps->handle, 0);
     }
 
     ps->state = 0;
@@ -4651,52 +4652,53 @@ ves_icall_System_Threading_ParkSpot_Set_internal (ParkSpot *ps)
      * satisfies some previous wait it was in the middle of.
      */
 
-    if (ps->thread == mono_thread_internal_current()) {
+    if (ps->thread == mono_thread_internal_current ()) {
         ps->state = 1;
     } else {
-        park_spot_set_os_aware(ps);
+        park_spot_set_os_aware (ps);
     }
 }
 
 static inline void 
-respond_to_interrupt_request (MonoInternalThread *thread, gboolean clr_state) {
+respond_to_interrupt_request (MonoInternalThread *thread, gboolean clr_state) 
+{
     if (thread->thread_interrupt_requested) {
         if (clr_state) {
-            mono_thread_clr_state(thread, ThreadState_WaitSleepJoin);
+            mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
         }
 
-        mono_thread_interruption_checkpoint();
+        mono_thread_interruption_checkpoint ();
 
         /*
          * Recheck because the thread may also have been suspended,
          * which is checked first in mono_thread_execute_interruption.
          */
 
-        mono_thread_current_check_pending_interrupt();
-        g_assert_not_reached();
+        mono_thread_current_check_pending_interrupt ();
+        g_assert_not_reached ();
     }
 }
 
-gint32 
+gboolean 
 wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed) 
 {
     guint32 result;      
     MonoInternalThread *thread = ps->thread;
-    int last_time = (timeout != INFINITE) ? mono_msec_ticks() : 0;
+    int last_time = (timeout != INFINITE) ? mono_msec_ticks () : 0;
 
     do {         
         if (ps->state != 0) {
-            return WAIT_OBJECT_0;
+            return TRUE;
         }
 
         if (timeout == 0) {
-            return WAIT_TIMEOUT;
+            return FALSE;
         }
         
-        respond_to_interrupt_request(thread, FALSE);
+        respond_to_interrupt_request (thread, FALSE);
 
         if (managed) {
-            mono_thread_set_state(thread, ThreadState_WaitSleepJoin);
+            mono_thread_set_state (thread, ThreadState_WaitSleepJoin);
         }
 
         /*
@@ -4704,13 +4706,13 @@ wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed)
          * before setting the state to WaitSleepJoin.
          */
 
-        respond_to_interrupt_request(thread, managed);
+        respond_to_interrupt_request (thread, managed);
 
         if (thread->thread_interrupt_requested) {
             if (managed) {
-                mono_thread_set_state(thread, ThreadState_WaitSleepJoin);
+                mono_thread_set_state (thread, ThreadState_WaitSleepJoin);
             }
-            mono_thread_interruption_checkpoint();
+            mono_thread_interruption_checkpoint ();
 
         }
 
@@ -4718,20 +4720,21 @@ wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed)
          * Perfom the wait using some OS aware mechanism.
          */
 
-        result = park_spot_wait_os_aware(ps, timeout);
+        result = park_spot_wait_os_aware (ps, timeout);
 
         if (managed) {
-            mono_thread_clr_state(thread, ThreadState_WaitSleepJoin);
+            mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
         }
 
         if (result != WAIT_IO_COMPLETION) {
-            return result;
+						g_assert (result == WAIT_OBJECT_0 || result == WAIT_TIMEOUT);
+            return result == WAIT_OBJECT_0;
         }
 
-        mono_thread_interruption_checkpoint();
+        mono_thread_interruption_checkpoint ();
 
         if (ps->state == 0 && timeout != INFINITE) {
-            int now = mono_msec_ticks();
+            int now = mono_msec_ticks ();
             int elapsed = (now == last_time) ? 1 : now - last_time;
             if (elapsed < timeout)
                 timeout -= elapsed;
@@ -4742,8 +4745,8 @@ wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed)
     } while (TRUE);
 }
 
-gint32 
+gboolean 
 ves_icall_System_Threading_ParkSpot_Wait_internal (ParkSpot *ps, int timeout)
 {
-    return wait_for_park_spot(ps, timeout, TRUE);
+    return wait_for_park_spot (ps, timeout, TRUE);
 }
