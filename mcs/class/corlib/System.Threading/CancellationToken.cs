@@ -1,148 +1,157 @@
 //
-// CancellationToken.cs
+// System.Threading.CancellationToken.cs
 //
-// Author:
-//       Jérémie "Garuma" Laval <jeremie.laval@gmail.com>
+// Copyright 2011 Duarte Nunes
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+// http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //
-// Copyright (c) 2009 Jérémie "Garuma" Laval
+// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
-using System;
-using System.Threading;
 
 #if NET_4_0 || MOBILE
+
 namespace System.Threading
 {
-	[System.Diagnostics.DebuggerDisplay ("IsCancellationRequested = {IsCancellationRequested}")]
-	public struct CancellationToken
-	{
-		bool canBeCanceled;
-		bool initialized;
-		CancellationTokenSource source;
+    [Diagnostics.DebuggerDisplay ("IsCancellationRequested = {IsCancellationRequested}")]
+    public struct CancellationToken
+    {
+        private static readonly Action<object> callArgAsAction = arg => ((Action) arg)();
 
-		public CancellationToken (bool canceled)
-			: this ()
-		{
-			initialized = true;
-			canBeCanceled = canceled;
-			// This is correctly set later if token originates from a Source
-			source = canceled ? CancellationTokenSource.CanceledSource : CancellationTokenSource.NoneSource;
-		}
+        private readonly CancellationTokenSource cts;
 
-		public static CancellationToken None {
-			get {
-				return CancellationTokenSource.NoneSource.Token;
-			}
-		}
+        public CancellationToken (bool canceled)
+            : this (canceled ? CancellationTokenSource.CTS_CANCELLED
+                             : CancellationTokenSource.CTS_NOT_CANCELABLE) { }
 
-		public CancellationTokenRegistration Register (Action callback)
-		{
-			return Register (callback, false);
-		}
+        internal CancellationToken (CancellationTokenSource cts)
+        {
+            this.cts = cts;
+        }
 
-		public CancellationTokenRegistration Register (Action callback, bool useSynchronizationContext)
-		{
-			if (callback == null)
-				throw new ArgumentNullException ("callback");
+        public static CancellationToken None {
+            get { return new CancellationToken (); }
+        }
 
-			return Source.Register (callback, useSynchronizationContext);
-		}
+        public bool IsCancellationRequested {
+            get { return cts != null && cts.IsCancellationRequested; }
+        }
 
-		public CancellationTokenRegistration Register (Action<object> callback, object state)
-		{
-			return Register (callback, state, false);
-		}
+        public bool CanBeCanceled {
+            get { return cts != null && cts.CanBeCanceled; }
+        }
 
-		public CancellationTokenRegistration Register (Action<object> callback, object state, bool useSynchronizationContext)
-		{
-			if (callback == null)
-				throw new ArgumentNullException ("callback");
+        public WaitHandle WaitHandle {
+            get { return cts.WaitHandle; }
+        }
 
-			return Register (() => callback (state), useSynchronizationContext);
-		}
+        public CancellationTokenRegistration Register (Action callback)
+        {
+            if (callback == null) {
+                throw new ArgumentNullException ("callback");
+            }
 
-		public void ThrowIfCancellationRequested ()
-		{
-			if (initialized && Source.IsCancellationRequested)
-				throw new OperationCanceledException (this);
-		}
+            return Register (callArgAsAction, callback, false, true);
+        }
 
-		public bool Equals (CancellationToken other)
-		{
-			return this.Source == other.Source;
-		}
+        public CancellationTokenRegistration Register (Action callback,
+                                                       bool useSynchronizationContext)
+        {
+            if (callback == null) {
+                throw new ArgumentNullException ("callback");
+            }
 
-		public override bool Equals (object other)
-		{
-			return (other is CancellationToken) ? Equals ((CancellationToken)other) : false;
-		}
+            return Register (callArgAsAction, callback, useSynchronizationContext, true);
+        }
 
-		public override int GetHashCode ()
-		{
-			return Source.GetHashCode ();
-		}
+        public CancellationTokenRegistration Register (Action<Object> callback, object state)
+        {
+            return Register (callback, state, false, true);
+        }
 
-		public static bool operator == (CancellationToken left, CancellationToken right)
-		{
-			return left.Equals (right);
-		}
+        public CancellationTokenRegistration Register (Action<Object> callback, Object state,
+                                                       bool useSynchronizationContext)
+        {
+            return Register (callback, state, useSynchronizationContext, true);
+        }
 
-		public static bool operator != (CancellationToken left, CancellationToken right)
-		{
-			return !left.Equals (right);
-		}
+        internal CancellationTokenRegistration InternalRegister (Action<object> callback,
+                                                                 object state)
+        {
+            return Register (callback, state, false, false);
+        }
 
-		public bool CanBeCanceled {
-			get {
-				return canBeCanceled;
-			}
-		}
+        private CancellationTokenRegistration Register (Action<Object> callback, object state,
+                                                        bool useSynchronizationContext,
+                                                        bool useEctx)
+        {
+            if (callback == null) {
+                throw new ArgumentNullException ("ccb");
+            }
 
-		public bool IsCancellationRequested {
-			get {
-				return initialized && Source.IsCancellationRequested;
-			}
-		}
+            if (!CanBeCanceled) {
+                return new CancellationTokenRegistration ();
+            }
 
-		public WaitHandle WaitHandle {
-			get {
-				return Source.WaitHandle;
-			}
-		}
+            SynchronizationContext sctx = null;
+            ExecutionContext ectx = null;
 
-		internal CancellationTokenSource Source {
-			get {
-				if (!initialized)
-					CorrectlyInitialize ();
-				return source;
-			}
-			set {
-				source = value;
-			}
-		}
+            if (!IsCancellationRequested) {
+                if (useSynchronizationContext) {
+                    sctx = SynchronizationContext.Current;
+                }
 
-		void CorrectlyInitialize ()
-		{
-			Source = CancellationTokenSource.NoneSource;
-			initialized = true;
-		}
-	}
+                if (useEctx) {
+                    ectx = ExecutionContext.Capture ();
+                }
+            }
+
+            return cts.InternalRegister (callback, state, sctx, ectx);
+        }
+
+        public void ThrowIfCancellationRequested ()
+        {
+            if (IsCancellationRequested) {
+                throw new OperationCanceledException (this);
+            }
+        }
+
+        public bool Equals (CancellationToken other)
+        {
+            return cts == other.cts;
+        }
+
+        public override bool Equals (object other)
+        {
+            return other is CancellationToken && Equals ((CancellationToken) other);
+        }
+
+        public override int GetHashCode ()
+        {
+            return cts == null
+                       ? CancellationTokenSource.CTS_NOT_CANCELABLE.GetHashCode ()
+                       : cts.GetHashCode ();
+        }
+
+        public static bool operator == (CancellationToken left, CancellationToken right)
+        {
+            return left.Equals (right);
+        }
+
+        public static bool operator != (CancellationToken left, CancellationToken right)
+        {
+            return !left.Equals (right);
+        }
+    }
 }
+
 #endif
