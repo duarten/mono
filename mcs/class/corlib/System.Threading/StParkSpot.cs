@@ -1,5 +1,5 @@
 //
-// System.Threading.ParkSpot.cs
+// System.Threading.StParkSpot.cs
 //
 // Copyright 2011 Duarte Nunes
 // 
@@ -22,34 +22,33 @@ using System.Runtime.CompilerServices;
 
 namespace System.Threading 
 {
-
-	internal struct ParkSpot 
+	internal struct StParkSpot 
 	{
         private IntPtr ps;
 
         internal void Alloc () 
-				{
+		{
             ps = Alloc_internal ();
         }
 
         internal void Free () 
-				{
+		{
             Free_internal (ps);
         }
 
         internal void Set () 
-				{
+		{
             Set_internal (ps);
         }
 
         internal void Wait (StParker pk, StCancelArgs cargs) 
-				{
+		{
             int ws;
             bool interrupted = false;
             do {
                 try {
                     ws = Wait_internal (ps, cargs.Timeout) 
-											 ? StParkStatus.Success
+                       ? StParkStatus.Success
                        : StParkStatus.Timeout;
                     break;
                 } catch (ThreadInterruptedException) {
@@ -57,7 +56,7 @@ namespace System.Threading
                         ws = StParkStatus.Interrupted;
                         break;
                     }
-										interrupted = true;
+					interrupted = true;
                 }
             } while (true);
 
@@ -71,9 +70,9 @@ namespace System.Threading
                 if (pk.TryCancel()) {
                     pk.UnparkSelf(ws);
                 } else {
-										if (ws == StParkStatus.Interrupted)  {
-										    interrupted = true;
-										}
+					if (ws == StParkStatus.Interrupted)  {
+						interrupted = true;
+					}
 										
                     do {
                         try {
@@ -97,15 +96,15 @@ namespace System.Threading
         }
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static IntPtr Alloc_internal ();
+		private static extern IntPtr Alloc_internal ();
         
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static void Free_internal (IntPtr ps);
+		private static extern void Free_internal (IntPtr ps);
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static void Set_internal (IntPtr ps);
+		private static extern void Set_internal (IntPtr ps);
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
-				private extern static bool Wait_internal (IntPtr ps, int timeout);
+		private static extern bool Wait_internal (IntPtr ps, int timeout);
     }
 }

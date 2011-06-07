@@ -1,5 +1,5 @@
 ﻿//
-// System.Threading.ParkStatus.cs
+// System.Threading.StParkStatus.cs
 //
 // Copyright 2011 Carlos Martins, Duarte Nunes
 // 
@@ -18,18 +18,14 @@
 // Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 
-using System;
 
-namespace System.Threading  {
-
-    //
-    // Integer values used as park wait status.
-    //
-
-    public static class StParkStatus {
-        public const int Success = 0;
-        public const int Timeout = -2;
-        public const int Alerted = -3;
-        public const int Interrupted = -4;
+namespace System.Threading  
+{
+    internal static class StParkStatus {
+        internal const int Success = 0;
+        internal const int Timeout = -2;
+        internal const int Alerted = -3;
+        internal const int Interrupted = -4;
+        internal const int StateChange = Int32.MaxValue;
     }
 }

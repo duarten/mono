@@ -1,5 +1,5 @@
 //
-// System.Threading.Alerter.cs
+// System.Threading.StAlerter.cs
 //
 // Copyright 2011 Carlos Martins, Duarte Nunes
 // 
@@ -18,26 +18,31 @@
 // Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 
-using System;
-
 #pragma warning disable 0420
 
 namespace System.Threading 
 {
-		public class StThreadAlertedException : SystemException 
-		{
-				public StThreadAlertedException () 
-					: base ("Wait alerted") { }
+    internal class StThreadAlertedException : SystemException 
+	{
+        internal StThreadAlertedException() 
+			: base ("Wait alerted") { }
 
-        public StThreadAlertedException (string msg) 
-					: base (msg) { }
+        internal StThreadAlertedException(string msg) 
+			: base (msg) { }
 
-        public StThreadAlertedException (string msg, Exception innerEx) 
-					: base (msg, innerEx) {}
+        internal StThreadAlertedException(string msg, Exception innerEx) 
+			: base (msg, innerEx) {}
     }
-		
-    public class StAlerter 
-		{
+
+    internal class StAlerter
+    {
+        public static readonly Action<object> CancellationTokenCallback = obj =>
+        {
+            var alerter = obj as StAlerter;
+            if (alerter != null) {
+                alerter.Set ();
+            }
+        };
 
         //
         // The state of the alerter is a non-blocking stack that links
@@ -49,10 +54,10 @@ namespace System.Threading
         internal volatile StParker state;
 
         public StAlerter () 
-				{ }
+		{ }
 
         internal StAlerter (bool alerted) 
-				{
+		{
             state = alerted ? ALERTED : null;
         }
 
@@ -60,7 +65,8 @@ namespace System.Threading
         // Returns true if the alerter is set.
         //
 
-        public bool IsSet {
+        internal bool IsSet
+        {
             get { return state == ALERTED; }
         }
 
@@ -69,7 +75,7 @@ namespace System.Threading
         //
 
         internal bool RegisterParker (StParker pk) 
-				{
+		{
             do {
                 StParker s;
 
@@ -98,7 +104,7 @@ namespace System.Threading
         //
 
         private void SlowDeregisterParker (StParker pk) 
-				{
+		{
             
             //
             // Absorb the locked parkers at top of the stack.
@@ -141,7 +147,7 @@ namespace System.Threading
         //
 
         internal void DeregisterParker (StParker pk) 
-				{
+		{
 
             //
             // Very often there is only a parker inserted in the alerter
@@ -159,8 +165,8 @@ namespace System.Threading
         // Sets the alerter.
         //
 
-        public bool Set () 
-				{
+        internal bool Set() 
+		{
             do {
                 StParker s;
                 if ((s = state) == ALERTED) {

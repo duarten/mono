@@ -1,0 +1,129 @@
+//
+// System.Threading.SemaphoreSlim.cs
+//
+// Copyright 2011 Carlos Martins, Duarte Nunes
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+// http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
+//
+
+#if NET_4_0 || MOBILE
+
+namespace System.Threading
+{
+	[Diagnostics.DebuggerDisplayAttribute ("Current Count = {currCount}")]
+	public class SemaphoreSlim : IDisposable
+	{
+		private const int defaultSpinCount = 100;
+
+	    private readonly StSemaphore sem;
+
+		public SemaphoreSlim (int initialCount) 
+            : this (initialCount, int.MaxValue) { }
+
+		public SemaphoreSlim (int initialCount, int maxCount)
+		{
+			if (initialCount < 0 || initialCount > maxCount || maxCount < 0) {
+			    throw new ArgumentOutOfRangeException ("initialCount");
+			}
+
+		    if (maxCount < 0) {
+                throw new ArgumentOutOfRangeException ("maxCount");
+            }
+
+		    sem = new StSemaphore (initialCount, maxCount, defaultSpinCount);
+		}
+
+		public int CurrentCount {
+			get { return sem.CurrentCount; }
+		}
+
+        //
+        // Just return a new Semaphore. We're assuming that the object 
+        // will be short lived, so we don't hang on to it. The user might
+        // try to set the Handle/SafeWaitHandle properties, but that leads
+        // to undefined behavior so we don't even worry about it.
+        //
+
+		public WaitHandle AvailableWaitHandle {
+			get { return new Semaphore (sem); }
+		}
+
+		public int Release ()
+		{
+			return Release(1);
+		}
+
+		public int Release (int releaseCount)
+		{
+		    return sem.Release (releaseCount);
+		}
+
+		public void Wait ()
+		{
+			Wait (CancellationToken.None);
+		}
+
+		public bool Wait (TimeSpan timeout)
+		{
+			return Wait ((int)timeout.TotalMilliseconds, CancellationToken.None);
+		}
+
+		public bool Wait (int millisecondsTimeout)
+		{
+			return Wait (millisecondsTimeout, CancellationToken.None);
+		}
+
+		public void Wait (CancellationToken cancellationToken)
+		{
+			Wait (-1, cancellationToken);
+		}
+
+		public bool Wait (TimeSpan timeout, CancellationToken cancellationToken)
+		{
+			return Wait ((int)timeout.TotalMilliseconds, cancellationToken);
+		}
+
+		public bool Wait (int millisecondsTimeout, CancellationToken cancellationToken)
+		{
+			if (millisecondsTimeout < -1)
+				throw new ArgumentOutOfRangeException ("millisecondsTimeout",
+				                                       "millisecondsTimeout is a negative number other than -1");
+
+			var alerter = cancellationToken.CanBeCanceled ? new StAlerter () : null;
+
+            using (cancellationToken.Register(StAlerter.CancellationTokenCallback, alerter)) {
+                try {
+                    return sem.Wait(1, new StCancelArgs (millisecondsTimeout, alerter));
+                } catch (StThreadAlertedException) {
+                    cancellationToken.ThrowIfCancellationRequested ();
+                    return false; /* Shut the compiler up */
+                }
+            }
+		}
+
+        #region IDisposable implementation
+
+        public void Dispose ()
+		{
+			Dispose(true);
+		}
+
+		protected virtual void Dispose (bool disposing)
+		{ }
+
+		#endregion
+	}
+}
+#endif

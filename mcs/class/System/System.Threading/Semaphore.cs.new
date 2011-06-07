@@ -1,0 +1,112 @@
+//
+// System.Threading.Semaphore.cs
+//
+// Copyright 2011 Duarte Nunes
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+// http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
+//
+
+#if NET_2_0
+
+using System.Runtime.ConstrainedExecution;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+
+namespace System.Threading 
+{
+	[ComVisible (false)]
+	public sealed class Semaphore : WaitHandle 
+	{
+		internal Semaphore (StWaitable waitable)
+		{
+			Waitable = waitable;
+		}
+
+		public Semaphore (int initialCount, int maximumCount)
+		{
+			if (initialCount < 0)
+				throw new ArgumentOutOfRangeException("initialCount", "< 0");
+			if (maximumCount < 1)
+				throw new ArgumentOutOfRangeException("maximumCount", "< 1");
+			if (initialCount > maximumCount)
+				throw new ArgumentException("initialCount > maximumCount");
+
+			Waitable = new StSemaphore (initialCount, maximumCount);
+		}
+
+		public Semaphore (int initialCount, int maximumCount, string name)
+		{
+			throw new NotImplementedException ();
+		}
+
+		public Semaphore (int initialCount, int maximumCount, string name, out bool createdNew)
+			: this (initialCount, maximumCount, name, out createdNew, null) { }
+
+		[MonoTODO ("Does not support access control, semaphoreSecurity is ignored")]
+		public Semaphore (int initialCount, int maximumCount, string name, out bool createdNew, 
+						  SemaphoreSecurity semaphoreSecurity)
+		{
+			throw new NotImplementedException ();
+		}
+
+		public static Semaphore OpenExisting (string name)
+		{
+			return OpenExisting(name, SemaphoreRights.Synchronize | SemaphoreRights.Modify);
+		}
+
+		public static Semaphore OpenExisting (string name, SemaphoreRights rights)
+		{
+			throw new NotImplementedException ();
+		}
+
+		[MonoTODO]
+		public SemaphoreSecurity GetAccessControl ()
+		{
+			throw new NotImplementedException ();
+		}
+
+		[PrePrepareMethod]
+		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
+		public int Release ()
+		{
+			return (Release (1));
+		}
+
+		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
+		public int Release (int releaseCount)
+		{
+			var sem = Waitable as StSemaphore;
+			return sem != null ? sem.Release(releaseCount) : 0; 
+		}
+
+		internal override bool _WaitOne(int timeout)
+		{
+			var sem = Waitable as StSemaphore;
+			return sem != null ? sem.Wait (1, new StCancelArgs (timeout)) : false; 
+		}
+
+		[MonoTODO]
+		public void SetAccessControl (SemaphoreSecurity semaphoreSecurity)
+		{
+			if (semaphoreSecurity == null) {
+				throw new ArgumentNullException ("semaphoreSecurity");
+			}
+
+			throw new NotImplementedException ();
+		}
+	}
+}
+
+#endif

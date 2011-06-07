@@ -1,33 +1,23 @@
 //
 // System.Threading.EventWaitHandle.cs
 //
-// Author:
-// 	Dick Porter (dick@ximian.com)
-//
-// (C) Ximian, Inc.	(http://www.ximian.com)
-// Copyright (C) 2005 Novell, Inc (http://www.novell.com)
-//
-// Permission is hereby granted, free of charge, to any person obtaining
-// a copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to whom the Software is furnished to do so, subject to
-// the following conditions:
+// Copyright 2011 Duarte Nunes
 // 
-// The above copyright notice and this permission notice shall be
-// included in all copies or substantial portions of the Software.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 // 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 
-using System.IO;
 using System.Runtime.InteropServices;
 #if !NET_2_1
 using System.Security.AccessControl;
@@ -38,47 +28,43 @@ namespace System.Threading
 	[ComVisible (true)]
 	public class EventWaitHandle : WaitHandle
 	{
-		private EventWaitHandle (IntPtr handle)
-		{
-			Handle = handle;
-		}
-
-		private bool IsManualReset (EventResetMode mode)
+		private static bool IsManualReset (EventResetMode mode)
 		{
 			if ((mode < EventResetMode.AutoReset) || (mode > EventResetMode.ManualReset))
 				throw new ArgumentException ("mode");
 			return (mode == EventResetMode.ManualReset);
 		}
 		
+        internal EventWaitHandle (StWaitable waitable)
+        {
+            Waitable = waitable;
+        }
+
 		public EventWaitHandle (bool initialState, EventResetMode mode)
 		{
-			bool created;
-			bool manual = IsManualReset (mode);
-			Handle = NativeEventCalls.CreateEvent_internal (manual, initialState, null, out created);
+            Waitable = IsManualReset (mode)
+                     ? (StWaitable) new StNotificationEvent(initialState) 
+                     : new StSynchronizationEvent(initialState);
+		}
+		
+		public EventWaitHandle (bool initialState, EventResetMode mode, string name)
+		{
+            throw new NotImplementedException ();
 		}
 		
 		public EventWaitHandle (bool initialState, EventResetMode mode,
-					string name)
+					            string name, out bool createdNew)
 		{
-			bool created;
-			bool manual = IsManualReset (mode);
-			Handle = NativeEventCalls.CreateEvent_internal (manual, initialState, name, out created);
+            throw new NotImplementedException ();
 		}
-		
-		public EventWaitHandle (bool initialState, EventResetMode mode,
-					string name, out bool createdNew)
-		{
-			bool manual = IsManualReset (mode);
-			Handle = NativeEventCalls.CreateEvent_internal (manual, initialState, name, out createdNew);
-		}
+
 #if !NET_2_1
 		[MonoTODO ("Implement access control")]
 		public EventWaitHandle (bool initialState, EventResetMode mode,
-					string name, out bool createdNew,
-					EventWaitHandleSecurity eventSecurity)
+					            string name, out bool createdNew,
+					            EventWaitHandleSecurity eventSecurity)
 		{
-			bool manual = IsManualReset (mode);
-			Handle = NativeEventCalls.CreateEvent_internal (manual, initialState, name, out createdNew);
+            throw new NotImplementedException ();
 		}
 		
 		[MonoTODO]
@@ -89,47 +75,53 @@ namespace System.Threading
 
 		public static EventWaitHandle OpenExisting (string name)
 		{
-			return(OpenExisting (name, EventWaitHandleRights.Synchronize | EventWaitHandleRights.Modify));
+            throw new NotImplementedException ();
 		}
 
 		public static EventWaitHandle OpenExisting (string name, EventWaitHandleRights rights)
 		{
-			if (name == null) {
-				throw new ArgumentNullException ("name");
-			}
-			if ((name.Length == 0) ||
-			    (name.Length > 260)) {
-				throw new ArgumentException ("name", Locale.GetText ("Invalid length [1-260]."));
-			}
-			
-			MonoIOError error;
-			IntPtr handle = NativeEventCalls.OpenEvent_internal (name, rights, out error);
-			if (handle == (IntPtr)null) {
-				if (error == MonoIOError.ERROR_FILE_NOT_FOUND) {
-					throw new WaitHandleCannotBeOpenedException (Locale.GetText ("Named Event handle does not exist: ") + name);
-				} else if (error == MonoIOError.ERROR_ACCESS_DENIED) {
-					throw new UnauthorizedAccessException ();
-				} else {
-					throw new IOException (Locale.GetText ("Win32 IO error: ") + error.ToString ());
-				}
-			}
-			
-			return(new EventWaitHandle (handle));
+            throw new NotImplementedException ();
 		}
 #endif
 		public bool Reset ()
 		{
-			CheckDisposed ();
-			
-			return (NativeEventCalls.ResetEvent_internal (Handle));
+            if (Waitable is StSynchronizationEvent) {
+                return ((StSynchronizationEvent)Waitable).Reset ();
+            }
+            
+            if (Waitable is StNotificationEvent) {
+                return ((StNotificationEvent)Waitable).Reset();
+            }
+
+		    return false;
 		}
 		
 		public bool Set ()
-		{
-			CheckDisposed ();
-			
-			return (NativeEventCalls.SetEvent_internal (Handle));
+        {
+            if (Waitable is StSynchronizationEvent) {
+                return ((StSynchronizationEvent)Waitable).Set ();
+            }
+            
+            if (Waitable is StNotificationEvent) {
+                return ((StNotificationEvent)Waitable).Set();
+            }
+
+		    return false;
 		}
+
+        internal override bool _WaitOne(int timeout)
+        {
+            if (Waitable is StSynchronizationEvent) {
+                return ((StSynchronizationEvent)Waitable).Wait (new StCancelArgs (timeout));
+            }
+            
+            if (Waitable is StNotificationEvent) {
+                return ((StNotificationEvent)Waitable).Wait (new StCancelArgs (timeout));
+            }
+
+		    return false;
+        }
+
 #if !NET_2_1
 		[MonoTODO]
 		public void SetAccessControl (EventWaitHandleSecurity eventSecurity)

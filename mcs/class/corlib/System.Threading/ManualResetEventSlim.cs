@@ -1,88 +1,75 @@
-// ManuelResetEventSlim.cs
 //
-// Copyright (c) 2008 Jérémie "Garuma" Laval
+// System.Threading.ManualResetEventSlim.cs
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Copyright 2011 Duarte Nunes
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+// http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-//
+// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 
 #if NET_4_0 || MOBILE
 
-using System;
-
 namespace System.Threading
 {
-	[System.Diagnostics.DebuggerDisplayAttribute ("Set = {IsSet}")]
+	[Diagnostics.DebuggerDisplayAttribute ("Set = {IsSet}")]
 	public class ManualResetEventSlim : IDisposable
 	{
-		const int isSet    = 1;
-		const int isNotSet = 0;
-		const int defaultSpinCount = 100;
+		private const int defaultSpinCount = 100;
 
-		int state;
-		readonly int spinCount;
+		private readonly StNotificationEvent evt;
 
-		ManualResetEvent handle;
+		public ManualResetEventSlim () 
+            : this (false, defaultSpinCount) { }
 
-		readonly static Watch sw = Watch.StartNew ();
-
-		public ManualResetEventSlim () : this (false, defaultSpinCount)
-		{
-		}
-
-		public ManualResetEventSlim (bool initialState) : this (initialState, defaultSpinCount)
-		{
-		}
+		public ManualResetEventSlim (bool initialState) 
+            : this (initialState, defaultSpinCount) { }
 
 		public ManualResetEventSlim (bool initialState, int spinCount)
 		{
 			if (spinCount < 0)
 				throw new ArgumentOutOfRangeException ("spinCount is less than 0", "spinCount");
 
-			this.state = initialState ? isSet : isNotSet;
-			this.spinCount = spinCount;
+		    evt = new StNotificationEvent (initialState, spinCount);
 		}
 
 		public bool IsSet {
-			get {
-				return state == isSet;
-			}
+			get { return evt.IsSet; }
 		}
 
 		public int SpinCount {
-			get {
-				return spinCount;
-			}
+			get { return evt.waitEvent.spinCount; }
+		}
+
+        //
+        // Just return a new EventWaitHandle. We're assuming that the object 
+        // will be short lived, so we don't hang on to it. The user might
+        // try to set the Handle/SafeWaitHandle properties, but that leads
+        // to undefined behavior so we don't even worry about it.
+        //
+
+		public WaitHandle WaitHandle {
+			get { return new EventWaitHandle (evt); }
 		}
 
 		public void Reset ()
 		{
-			state = isNotSet;
-			if (handle != null)
-				handle.Reset ();
+		    evt.Reset ();
 		}
 
 		public void Set ()
 		{
-			state = isSet;
-			if (handle != null)
-				handle.Set ();
+		    evt.Set ();
 		}
 
 		public void Wait ()
@@ -111,28 +98,16 @@ namespace System.Threading
 				throw new ArgumentOutOfRangeException ("millisecondsTimeout",
 				                                       "millisecondsTimeout is a negative number other than -1");
 
-			long start = millisecondsTimeout == -1 ? 0 : sw.ElapsedMilliseconds;
-			SpinWait wait = new SpinWait ();
+		    var alerter = cancellationToken.CanBeCanceled ? new StAlerter () : null;
 
-			while (state == isNotSet) {
-				cancellationToken.ThrowIfCancellationRequested ();
-
-				if (millisecondsTimeout > -1 && (sw.ElapsedMilliseconds - start) > millisecondsTimeout)
-					return false;
-
-				if (wait.Count < spinCount) {
-					wait.SpinOnce ();
-				} else {
-					int waitTime = millisecondsTimeout == -1 ? -1 : Math.Max (millisecondsTimeout - (int)(sw.ElapsedMilliseconds - start) , 1);
-					WaitHandle handle = WaitHandle;
-					if (state == isSet)
-						return true;
-					if (WaitHandle.WaitAny (new[] { handle, cancellationToken.WaitHandle }, waitTime, false) == 0)
-						return true;
-				}
-			}
-
-			return true;
+            using (cancellationToken.Register(StAlerter.CancellationTokenCallback, alerter)) {
+                try {
+                    return evt.Wait(new StCancelArgs (millisecondsTimeout, alerter));
+                } catch (StThreadAlertedException) {
+                    cancellationToken.ThrowIfCancellationRequested ();
+                    return false; /* Shut the compiler up */
+                }
+            }
 		}
 
 		public bool Wait (TimeSpan timeout, CancellationToken cancellationToken)
@@ -140,36 +115,17 @@ namespace System.Threading
 			return Wait ((int)timeout.TotalMilliseconds, cancellationToken);
 		}
 
-		public WaitHandle WaitHandle {
-			get {
-				if (handle != null) {
-					if (state == isSet)
-						handle.Set ();
-
-					return handle;
-				}
-
-				var result = LazyInitializer.EnsureInitialized (ref handle,
-				                                                () => new ManualResetEvent (state == isSet ? true : false));
-				if (state == isSet)
-					result.Set ();
-
-				return result;
-			}
-		}
-
 		#region IDisposable implementation
-		public void Dispose ()
+
+        public void Dispose ()
 		{
-			Dispose(true);
+			Dispose (true);
 		}
 
 		protected virtual void Dispose (bool disposing)
-		{
+		{ }
 
-		}
 		#endregion
-
 	}
 }
 #endif
