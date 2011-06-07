@@ -17,6 +17,8 @@
 #include <signal.h>
 #include <string.h>
 
+#include <errno.h>
+
 #if defined(__OpenBSD__)
 #include <pthread.h>
 #include <pthread_np.h>
@@ -49,9 +51,8 @@
 
 #include <mono/metadata/gc-internal.h>
 
-#ifdef PLATFORM_ANDROID
-#include <errno.h>
 
+#ifdef PLATFORM_ANDROID
 extern int tkill (pid_t tid, int signal);
 #endif
 
@@ -4726,9 +4727,8 @@ wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed)
             mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
         }
 
-        if (result != WAIT_IO_COMPLETION) {
-						g_assert (result == WAIT_OBJECT_0 || result == WAIT_TIMEOUT);
-            return result == WAIT_OBJECT_0;
+        if (errno != EINTR) {
+            return result == 0;
         }
 
         mono_thread_interruption_checkpoint ();
@@ -4736,10 +4736,11 @@ wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed)
         if (ps->state == 0 && timeout != INFINITE) {
             int now = mono_msec_ticks ();
             int elapsed = (now == last_time) ? 1 : now - last_time;
-            if (elapsed < timeout)
+            if (elapsed < timeout) {
                 timeout -= elapsed;
-            else
+            } else {
                 timeout = 0;
+			}
             last_time = now;
         }
     } while (TRUE);
