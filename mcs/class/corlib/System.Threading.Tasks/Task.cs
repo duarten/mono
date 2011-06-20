@@ -167,9 +167,13 @@ namespace System.Threading.Tasks
 		
 		public void RunSynchronously (TaskScheduler scheduler)
 		{
-			if (this.Status != TaskStatus.Created)
+			if (Status > TaskStatus.WaitingForActivation)
 				throw new InvalidOperationException ("The task is not in a valid state to be started");
-			if (scheduler.TryExecuteTask (this))
+
+			SetupScheduler (scheduler);
+			status = TaskStatus.WaitingToRun;
+
+			if (scheduler.RunInline (this))
 				return;
 
 			Start (scheduler);
@@ -338,7 +342,7 @@ namespace System.Threading.Tasks
 		void CheckAndSchedule (Task continuation, TaskContinuationOptions options, TaskScheduler scheduler, bool fromCaller)
 		{
 			if ((options & TaskContinuationOptions.ExecuteSynchronously) > 0)
-				continuation.ThreadStart ();
+				continuation.RunSynchronously (scheduler);
 			else
 				continuation.Start (scheduler);
 		}
@@ -359,7 +363,7 @@ namespace System.Threading.Tasks
 		
 		#region Internal and protected thingies
 		internal void Schedule ()
-		{	
+		{
 			status = TaskStatus.WaitingToRun;
 			
 			// If worker is null it means it is a local one, revert to the old behavior

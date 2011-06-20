@@ -85,6 +85,11 @@ int WSAAPI getnameinfo(const struct sockaddr*,socklen_t,char*,DWORD,
 #define DISABLE_DEBUGGER_AGENT 1
 #endif
 
+#if defined(__MACH__)
+#include <mono/utils/mono-threads.h>
+#endif
+
+
 #ifndef DISABLE_DEBUGGER_AGENT
 
 #include <mono/io-layer/mono-mutex.h>
@@ -288,7 +293,9 @@ typedef enum {
 	EVENT_KIND_STEP = 11,
 	EVENT_KIND_TYPE_LOAD = 12,
 	EVENT_KIND_EXCEPTION = 13,
-	EVENT_KIND_KEEPALIVE = 14
+	EVENT_KIND_KEEPALIVE = 14,
+	EVENT_KIND_USER_BREAK = 15,
+	EVENT_KIND_USER_LOG = 16
 } EventKind;
 
 typedef enum {
@@ -507,6 +514,9 @@ typedef struct {
 	MonoObject *exc;
 	MonoContext catch_ctx;
 	gboolean caught;
+	/* For EVENT_KIND_USER_LOG */
+	int level;
+	char *category, *message;
 } EventInfo;
 
 /* Dummy structure used for the profiler callbacks */
@@ -515,6 +525,16 @@ typedef struct {
 } DebuggerProfiler;
 
 #define DEBUG(level,s) do { if (G_UNLIKELY ((level) <= log_level)) { s; fflush (log_file); } } while (0)
+
+#ifdef TARGET_WIN32
+#define get_last_sock_error() WSAGetLastError()
+#define MONO_EWOULDBLOCK WSAEWOULDBLOCK
+#define MONO_EINTR WSAEINTR
+#else
+#define get_last_sock_error() errno
+#define MONO_EWOULDBLOCK EWOULDBLOCK
+#define MONO_EINTR EINTR
+#endif
 
 /*
  * Globals
@@ -877,6 +897,12 @@ mono_debugger_agent_init (void)
 
 	if (!agent_config.onuncaught && !agent_config.onthrow)
 		finish_agent_init (TRUE);
+
+#if defined(__MACH__)
+	/*FIXME Under darwin, we need to disable the new interruption code since sdb needs to old signal based one.*/
+	mono_thread_info_disable_new_interrupt (TRUE);
+#endif
+
 }
 
 /*
@@ -963,11 +989,11 @@ recv_length (int fd, void *buf, int len, int flags)
 		res = recv (fd, (char *) buf + total, len - total, flags);
 		if (res > 0)
 			total += res;
-		if (agent_config.keepalive && res == -1 && errno == EWOULDBLOCK) {
+		if (agent_config.keepalive && res == -1 && get_last_sock_error () == MONO_EWOULDBLOCK) {
 			process_profiler_event (EVENT_KIND_KEEPALIVE, NULL);
 			goto again;
 		}
-	} while ((res > 0 && total < len) || (res == -1 && errno == EINTR));
+	} while ((res > 0 && total < len) || (res == -1 && get_last_sock_error () == MONO_EINTR));
 	return total;
 }
 
@@ -1015,7 +1041,7 @@ transport_handshake (void)
 	sprintf (handshake_msg, "DWP-Handshake");
 	do {
 		res = send (conn_fd, handshake_msg, strlen (handshake_msg), 0);
-	} while (res == -1 && errno == EINTR);
+	} while (res == -1 && get_last_sock_error () == MONO_EINTR);
 	g_assert (res != -1);
 
 	/* Read answer */
@@ -1066,7 +1092,7 @@ transport_connect (const char *host, int port)
 #else
 	struct hostent *result;
 #endif
-	int sfd, s, res;
+	int sfd = -1, s, res;
 	char port_string [128];
 
 	conn_fd = -1;
@@ -1113,7 +1139,7 @@ transport_connect (const char *host, int port)
 			/* This will bind the socket to a random port */
 			res = listen (sfd, 16);
 			if (res == -1) {
-				fprintf (stderr, "debugger-agent: Unable to setup listening socket: %s\n", strerror (errno));
+				fprintf (stderr, "debugger-agent: Unable to setup listening socket: %s\n", strerror (get_last_sock_error ()));
 				exit (1);
 			}
 			listen_fd = sfd;
@@ -1245,7 +1271,7 @@ transport_send (guint8 *data, int len)
 
 	do {
 		res = send (conn_fd, data, len, 0);
-	} while (res == -1 && errno == EINTR);
+	} while (res == -1 && get_last_sock_error () == MONO_EINTR);
 	if (res != len)
 		return FALSE;
 	else
@@ -1777,21 +1803,6 @@ mono_debugger_agent_free_domain_info (MonoDomain *domain)
 
 	mono_loader_lock ();
 	g_hash_table_remove (domains, domain);
-	mono_loader_unlock ();
-}
-
-/*
- * Called when deferred debugger session is attached, 
- * after the VM start event has been sent successfully
- */
-static void
-mono_debugger_agent_on_attach (void)
-{
-	/* Emit load events for currently loaded appdomains, assemblies, and types */
-	mono_loader_lock ();
-	g_hash_table_foreach (domains, emit_appdomain_load, NULL);
-	mono_g_hash_table_foreach (tid_to_thread, emit_thread_start, NULL);
-	mono_assembly_foreach (emit_assembly_load, NULL);
 	mono_loader_unlock ();
 }
 
@@ -3045,8 +3056,11 @@ process_event (EventKind event, gpointer arg, gint32 il_offset, MonoContext *ctx
 
 		if (agent_config.defer) {
 			/* Make sure the thread id is always set when doing deferred debugging */
-			if (debugger_thread_id == GetCurrentThreadId ())
+			if (debugger_thread_id == GetCurrentThreadId ()) {
+				/* Don't suspend on events from the debugger thread */
+				suspend_policy = SUSPEND_POLICY_NONE;
 				thread = mono_thread_get_main ();
+			}
 			else thread = mono_thread_current ();
 		} else {
 			if (debugger_thread_id == GetCurrentThreadId () && event != EVENT_KIND_VM_DEATH)
@@ -3105,6 +3119,15 @@ process_event (EventKind event, gpointer arg, gint32 il_offset, MonoContext *ctx
 			buffer_add_objid (&buf, ei->exc);
 			break;
 		}
+		case EVENT_KIND_USER_BREAK:
+			break;
+		case EVENT_KIND_USER_LOG: {
+			EventInfo *ei = arg;
+			buffer_add_int (&buf, ei->level);
+			buffer_add_string (&buf, ei->category ? ei->category : "");
+			buffer_add_string (&buf, ei->message ? ei->message : "");
+			break;
+		}
 		case EVENT_KIND_KEEPALIVE:
 			suspend_policy = SUSPEND_POLICY_NONE;
 			break;
@@ -3151,8 +3174,6 @@ process_event (EventKind event, gpointer arg, gint32 il_offset, MonoContext *ctx
 	
 	if (event == EVENT_KIND_VM_START) {
 		vm_start_event_sent = TRUE;
-		if (agent_config.defer)
-			mono_debugger_agent_on_attach ();
 	}
 	
 	DEBUG (1, fprintf (log_file, "[%p] Sent event %s, suspend=%d.\n", (gpointer)GetCurrentThreadId (), event_to_string (event), suspend_policy));
@@ -3417,6 +3438,25 @@ send_type_load (MonoClass *klass)
 	mono_loader_unlock ();
 	if (type_load)
 		emit_type_load (klass, klass, NULL);
+}
+
+/*
+ * Emit load events for all types currently loaded in the domain.
+ * Takes the loader and domain locks.
+ * user_data is unused.
+ */
+static void
+send_types_for_domain (MonoDomain *domain, void *user_data)
+{
+	AgentDomainInfo *info = NULL;
+	
+	mono_loader_lock ();
+	mono_domain_lock (domain);
+	info =  get_agent_domain_info (domain);
+	g_assert (info);
+	g_hash_table_foreach (info->loaded_classes, emit_type_load, NULL);
+	mono_domain_unlock (domain);
+	mono_loader_unlock ();
 }
 
 static void
@@ -4052,6 +4092,44 @@ mono_debugger_agent_breakpoint_hit (void *sigctx)
 	resume_from_signal_handler (sigctx, process_breakpoint);
 }
 
+static gboolean
+user_break_cb (StackFrameInfo *frame, MonoContext *ctx, gpointer data)
+{
+	if (frame->managed) {
+		*(MonoContext*)data = *ctx;
+
+		return TRUE;
+	} else {
+		return FALSE;
+	}
+}
+
+/*
+ * Called by System.Diagnostics.Debugger:Break ().
+ */
+void
+mono_debugger_agent_user_break (void)
+{
+	if (agent_config.enabled) {
+		MonoContext ctx;
+		int suspend_policy;
+		GSList *events;
+
+		/* Obtain a context */
+		MONO_CONTEXT_SET_IP (&ctx, NULL);
+		mono_walk_stack_with_ctx (user_break_cb, NULL, 0, &ctx);
+		g_assert (MONO_CONTEXT_GET_IP (&ctx) != NULL);
+
+		mono_loader_lock ();
+		events = create_event_list (EVENT_KIND_USER_BREAK, NULL, NULL, NULL, &suspend_policy);
+		mono_loader_unlock ();
+
+		process_event (EVENT_KIND_USER_BREAK, NULL, 0, &ctx, events, suspend_policy);
+	} else {
+		G_BREAKPOINT ();
+	}
+}
+
 static const char*
 ss_depth_to_string (StepDepth depth)
 {
@@ -4513,6 +4591,40 @@ ss_destroy (SingleStepReq *req)
 
 	g_free (ss_req);
 	ss_req = NULL;
+}
+
+/*
+ * Called from metadata by the icall for System.Diagnostics.Debugger:Log ().
+ */
+void
+mono_debugger_agent_debug_log (int level, MonoString *category, MonoString *message)
+{
+	int suspend_policy;
+	GSList *events;
+	EventInfo ei;
+
+	if (!agent_config.enabled)
+		return;
+
+	mono_loader_lock ();
+	events = create_event_list (EVENT_KIND_USER_LOG, NULL, NULL, NULL, &suspend_policy);
+	mono_loader_unlock ();
+
+	ei.level = level;
+	ei.category = category ? mono_string_to_utf8 (category) : NULL;
+	ei.message = message ? mono_string_to_utf8 (message) : NULL;
+
+	process_event (EVENT_KIND_USER_LOG, &ei, 0, NULL, events, suspend_policy);
+
+	g_free (ei.category);
+	g_free (ei.message);
+}
+
+gboolean
+mono_debugger_agent_debug_log_is_enabled (void)
+{
+	/* Treat this as true even if there is no event request for EVENT_KIND_USER_LOG */
+	return agent_config.enabled;
 }
 
 void
@@ -5845,6 +5957,30 @@ event_commands (int command, guint8 *p, guint8 *end, Buffer *buf)
 
 		mono_loader_lock ();
 		g_ptr_array_add (event_requests, req);
+		
+		if (agent_config.defer) {
+			/* Transmit cached data to the client on receipt of the event request */
+			switch (req->event_kind) {
+			case EVENT_KIND_APPDOMAIN_CREATE:
+				/* Emit load events for currently loaded domains */
+				g_hash_table_foreach (domains, emit_appdomain_load, NULL);
+				break;
+			case EVENT_KIND_ASSEMBLY_LOAD:
+				/* Emit load events for currently loaded assemblies */
+				mono_assembly_foreach (emit_assembly_load, NULL);
+				break;
+			case EVENT_KIND_THREAD_START:
+				/* Emit start events for currently started threads */
+				mono_g_hash_table_foreach (tid_to_thread, emit_thread_start, NULL);
+				break;
+			case EVENT_KIND_TYPE_LOAD:
+				/* Emit type load events for currently loaded types */
+				mono_domain_foreach (send_types_for_domain, NULL);
+				break;
+			default:
+				break;
+			}
+		}
 		mono_loader_unlock ();
 
 		buffer_add_int (buf, req->id);
@@ -7518,6 +7654,23 @@ mono_debugger_agent_begin_exception_filter (MonoException *exc, MonoContext *ctx
 void
 mono_debugger_agent_end_exception_filter (MonoException *exc, MonoContext *ctx, MonoContext *orig_ctx)
 {
+}
+
+void
+mono_debugger_agent_user_break (void)
+{
+	G_BREAKPOINT ();
+}
+
+void
+mono_debugger_agent_debug_log (int level, MonoString *category, MonoString *message)
+{
+}
+
+gboolean
+mono_debugger_agent_debug_log_is_enabled (void)
+{
+	return FALSE;
 }
 
 #endif

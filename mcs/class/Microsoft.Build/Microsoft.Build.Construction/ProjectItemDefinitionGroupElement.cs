@@ -26,27 +26,36 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 
-using System.Collections.Generic;
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Build.Internal;
 
 namespace Microsoft.Build.Construction
 {
+        [System.Diagnostics.DebuggerDisplayAttribute ("#ItemDefinitions={Count} Condition={Condition} Label={Label}")]
         public class ProjectItemDefinitionGroupElement : ProjectElementContainer
         {
-                public ICollection<ProjectItemDefinitionElement> ItemDefinitions {
-                        get {
-                                throw new NotImplementedException ();
-                        }
+                internal ProjectItemDefinitionGroupElement (ProjectRootElement containingProject)
+                {
+                        ContainingProject = containingProject;
                 }
-
+                public ICollection<ProjectItemDefinitionElement> ItemDefinitions {
+                        get { return new CollectionFromEnumerable<ProjectItemDefinitionElement> (
+                                new FilteredEnumerable<ProjectItemDefinitionElement> (Children)); }
+                }
                 public ProjectItemDefinitionElement AddItemDefinition (string itemType)
                 {
-                        throw new NotImplementedException ();
+                        var definition = ContainingProject.CreateItemDefinitionElement (itemType);
+                        AppendChild (definition);
+                        return definition;
                 }
                 internal override string XmlName {
-                        get {
-                                throw new NotImplementedException ();
-                        }
+                        get { return "ItemDefinitionGroup"; }
+                }
+                internal override ProjectElement LoadChildElement (string name)
+                {
+                        return AddItemDefinition (name);
                 }
         }
 }

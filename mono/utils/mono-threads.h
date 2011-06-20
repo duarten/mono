@@ -97,6 +97,9 @@ typedef struct {
 	void (*thread_unregister)(THREAD_INFO_TYPE *info);
 	void (*thread_attach)(THREAD_INFO_TYPE *info);
 	gboolean (*mono_method_is_critical) (void *method);
+#ifndef HOST_WIN32
+	int (*mono_gc_pthread_create) (pthread_t *new_thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);
+#endif
 } MonoThreadInfoCallbacks;
 
 typedef struct {
@@ -129,6 +132,9 @@ mono_threads_init (MonoThreadInfoCallbacks *callbacks, size_t thread_info_size) 
 
 void
 mono_threads_runtime_init (MonoThreadInfoRuntimeCallbacks *callbacks) MONO_INTERNAL;
+
+MonoThreadInfoCallbacks *
+mono_threads_get_callbacks (void) MONO_INTERNAL;
 
 MonoThreadInfoRuntimeCallbacks *
 mono_threads_get_runtime_callbacks (void) MONO_INTERNAL;
@@ -177,6 +183,10 @@ mono_thread_info_suspend_unlock (void) MONO_INTERNAL;
 
 void
 mono_threads_unregister_current_thread (THREAD_INFO_TYPE *info) MONO_INTERNAL;
+
+void
+mono_thread_info_disable_new_interrupt (gboolean disable) MONO_INTERNAL;
+
 
 #if !defined(HOST_WIN32)
 

@@ -51,6 +51,7 @@
 #include <mono/metadata/profiler-private.h>
 #include <mono/metadata/profiler.h>
 #include <mono/utils/mono-compiler.h>
+#include <mono/utils/mono-memory-model.h>
 #include <mono/metadata/mono-basic-block.h>
 
 #include "mini.h"
@@ -4273,6 +4274,17 @@ mini_emit_inst_for_ctor (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignat
 }
 
 static MonoInst*
+emit_memory_barrier (MonoCompile *cfg, int kind)
+{
+	MonoInst *ins = NULL;
+	MONO_INST_NEW (cfg, ins, OP_MEMORY_BARRIER);
+	MONO_ADD_INS (cfg->cbb, ins);
+	ins->backend.memory_barrier_kind = kind;
+
+	return ins;
+}
+
+static MonoInst*
 mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig, MonoInst **args)
 {
 	MonoInst *ins = NULL;
@@ -4442,9 +4454,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			MONO_ADD_INS (cfg->cbb, ins);
 			return ins;
 		} else if (strcmp (cmethod->name, "MemoryBarrier") == 0) {
-			MONO_INST_NEW (cfg, ins, OP_MEMORY_BARRIER);
-			MONO_ADD_INS (cfg->cbb, ins);
-			return ins;
+			return emit_memory_barrier (cfg, FullBarrier);
 		}
 	} else if (cmethod->klass == mono_defaults.monitor_class) {
 
@@ -4498,6 +4508,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			return (MonoInst*)call;
 		}
 #elif defined(MONO_ARCH_ENABLE_MONITOR_IL_FASTPATH)
+		{
 		MonoMethod *fast_method = NULL;
 
 		/* Avoid infinite recursion */
@@ -4513,6 +4524,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			return NULL;
 
 		return (MonoInst*)mono_emit_method_call (cfg, fast_method, args, NULL);
+		}
 #endif
 	} else if (cmethod->klass->image == mono_defaults.corlib &&
 			   (strcmp (cmethod->klass->name_space, "System.Threading") == 0) &&
@@ -4685,11 +4697,12 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 	} else if (cmethod->klass->image == mono_defaults.corlib) {
 		if (cmethod->name [0] == 'B' && strcmp (cmethod->name, "Break") == 0
 				&& strcmp (cmethod->klass->name, "Debugger") == 0) {
-			if (should_insert_brekpoint (cfg->method))
-				MONO_INST_NEW (cfg, ins, OP_BREAK);
-			else
+			if (should_insert_brekpoint (cfg->method)) {
+				ins = mono_emit_jit_icall (cfg, mono_debugger_agent_user_break, NULL);
+			} else {
 				MONO_INST_NEW (cfg, ins, OP_NOP);
-			MONO_ADD_INS (cfg->cbb, ins);
+				MONO_ADD_INS (cfg->cbb, ins);
+			}
 			return ins;
 		}
 		if (cmethod->name [0] == 'g' && strcmp (cmethod->name, "get_IsRunningOnWindows") == 0
@@ -7627,6 +7640,11 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			ins_flag = 0;
 			MONO_ADD_INS (bblock, ins);
 			*sp++ = ins;
+			if (ins->flags & MONO_INST_VOLATILE) {
+				/* Volatile loads have acquire semantics, see 12.6.7 in Ecma 335 */
+				/* FIXME it's questionable if acquire semantics require full barrier or just LoadLoad*/
+				emit_memory_barrier (cfg, FullBarrier);
+			}
 			++ip;
 			break;
 		case CEE_STIND_REF:
@@ -7643,6 +7661,13 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			NEW_STORE_MEMBASE (cfg, ins, stind_to_store_membase (*ip), sp [0]->dreg, 0, sp [1]->dreg);
 			ins->flags |= ins_flag;
 			ins_flag = 0;
+
+			if (ins->flags & MONO_INST_VOLATILE) {
+				/* Volatile stores have release semantics, see 12.6.7 in Ecma 335 */
+				/* FIXME it's questionable if acquire semantics require full barrier or just LoadLoad*/
+				emit_memory_barrier (cfg, FullBarrier);
+			}
+
 			MONO_ADD_INS (bblock, ins);
 
 			if (cfg->gen_write_barriers && *ip == CEE_STIND_REF && method->wrapper_type != MONO_WRAPPER_WRITE_BARRIER && !((sp [1]->opcode == OP_PCONST) && (sp [1]->inst_p0 == 0)))
@@ -9987,6 +10012,12 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 
 				break;
 			}
+			case CEE_MONO_MEMORY_BARRIER: {
+				CHECK_OPSIZE (5);
+				emit_memory_barrier (cfg, (int)read32 (ip + 1));
+				ip += 5;
+				break;
+			}
 			default:
 				g_error ("opcode 0x%02x 0x%02x not handled", MONO_CUSTOM_PREFIX, ip [1]);
 				break;
@@ -10485,7 +10516,16 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 		UNVERIFIED;
 
 	bblock->cil_length = ip - bblock->cil_code;
-	bblock->next_bb = end_bblock;
+	if (bblock->next_bb) {
+		/* This could already be set because of inlining, #693905 */
+		MonoBasicBlock *bb = bblock;
+
+		while (bb->next_bb)
+			bb = bb->next_bb;
+		bb->next_bb = end_bblock;
+	} else {
+		bblock->next_bb = end_bblock;
+	}
 
 	if (cfg->method == method && cfg->domainvar) {
 		MonoInst *store;

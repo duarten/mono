@@ -29,11 +29,13 @@
 using System;
 using System.Collections.Generic;
 using System.Xml;
+using Microsoft.Build.Exceptions;
 
 namespace Microsoft.Build.Construction
 {
         public abstract class ProjectElement
         {
+                internal ProjectElement () {}
                 public ProjectRootElement ContainingProject { get; internal set; }
                 public ProjectElement PreviousSibling { get; internal set; }
                 public ProjectElementContainer Parent { get; internal set; }
@@ -42,10 +44,57 @@ namespace Microsoft.Build.Construction
                 public virtual string Condition { get; set; }
                 public IEnumerable<ProjectElementContainer> AllParents {
                         get {
-                                throw new NotImplementedException ();
+                                var parent = Parent;
+                                while(parent != null) {
+                                        yield return parent;
+                                        parent = parent.Parent;
+                                }
                         }
                 }
+                internal virtual void Load (XmlReader reader)
+                {
+                        reader.ReadToFollowing (XmlName);
+                        while (reader.MoveToNextAttribute ()) {
+                                LoadAttribute (reader.Name, reader.Value);
+                        }
+                        LoadValue (reader);
+                }
+                internal virtual void LoadAttribute (string name, string value)
+                {
+                        switch (name) {
+                        case "xmlns":
+                                break;
+                        case "Label":
+                                Label = value;
+                                break;
+                        case "Condition":
+                                Condition = value;
+                                break;
+                        default:
+                                throw new InvalidProjectFileException (string.Format (
+                                        "Attribute \"{0}\" is not known on node \"{1}\" [type {2}].", name, XmlName,
+                                        GetType ()));
+                        }
+                }
+                internal virtual void LoadValue (XmlReader reader)
+                {
+                }
                 internal abstract string XmlName { get; }
-                internal abstract void Save (XmlWriter writer);
+                internal virtual void Save (XmlWriter writer)
+                {
+                        writer.WriteStartElement (XmlName);
+                        SaveValue (writer);
+                        writer.WriteEndElement ();
+                }
+                internal virtual void SaveValue (XmlWriter writer)
+                {
+                        SaveAttribute (writer, "Label", Label);
+                        SaveAttribute (writer, "Condition", Condition);
+                }
+                internal void SaveAttribute (XmlWriter writer, string attributeName, string attributeValue)
+                {
+                        if (!string.IsNullOrWhiteSpace (attributeValue))
+                                writer.WriteAttributeString (attributeName, attributeValue);
+                }
         }
 }

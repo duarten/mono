@@ -3,6 +3,7 @@
  *
  * Author:
  * 	Paolo Molaro (lupus@ximian.com)
+ *  Rodrigo Kumpera (kumpera@gmail.com)
  *
  * Copyright 2005-2010 Novell, Inc (http://www.novell.com)
  *
@@ -24,6 +25,7 @@
  *
  * Copyright 2001-2003 Ximian, Inc
  * Copyright 2003-2010 Novell, Inc.
+ * Copyright 2011 Xamarin, Inc.
  * 
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -174,7 +176,9 @@
 	A good place to start is add_nursery_frag. The tricky thing here is
 	placing those objects atomically outside of a collection.
 
-
+ *) Allocation should use asymmetric Dekker synchronization:
+ 	http://blogs.oracle.com/dave/resource/Asymmetric-Dekker-Synchronization.txt
+	This should help weak consistency archs.
  */
 #include "config.h"
 #ifdef HAVE_SGEN_GC
@@ -217,6 +221,7 @@
 #include "utils/mono-semaphore.h"
 #include "utils/mono-counters.h"
 #include "utils/mono-proclib.h"
+#include "utils/mono-memory-model.h"
 
 #include <mono/utils/memcheck.h>
 
@@ -259,6 +264,7 @@ static gboolean conservative_stack_mark = FALSE;
 /* If set, do a plausibility check on the scan_starts before and after
    each collection */
 static gboolean do_scan_starts_check = FALSE;
+static gboolean nursery_collection_is_parallel = FALSE;
 static gboolean disable_minor_collections = FALSE;
 static gboolean disable_major_collections = FALSE;
 
@@ -646,9 +652,16 @@ static pthread_key_t thread_info_key;
 #endif
 
 #ifndef DISABLE_CRITICAL_REGION
-/* we use the memory barrier only to prevent compiler reordering (a memory constraint may be enough) */
-#define ENTER_CRITICAL_REGION do {IN_CRITICAL_REGION = 1;mono_memory_barrier ();} while (0)
-#define EXIT_CRITICAL_REGION  do {IN_CRITICAL_REGION = 0;mono_memory_barrier ();} while (0)
+
+/* Enter must be visible before anything is done in the critical region. */
+#define ENTER_CRITICAL_REGION do { mono_atomic_store_release (&IN_CRITICAL_REGION, 1); } while (0)
+
+/* Exit must make sure all critical regions stores are visible before it signal the end of the region. 
+ * We don't need to emit a full barrier since we
+ */
+#define EXIT_CRITICAL_REGION  do { mono_atomic_store_seq (&IN_CRITICAL_REGION, 0); } while (0)
+
+
 #endif
 
 /*
@@ -762,9 +775,6 @@ align_pointer (void *ptr)
 
 typedef SgenGrayQueue GrayQueue;
 
-typedef void (*CopyOrMarkObjectFunc) (void**, GrayQueue*);
-typedef char* (*ScanObjectFunc) (char*, GrayQueue*);
-
 /* forward declarations */
 static int stop_world (int generation);
 static int restart_world (int generation);
@@ -793,6 +803,8 @@ static gboolean drain_gray_stack (GrayQueue *queue, int max_objs);
 static void finish_gray_stack (char *start_addr, char *end_addr, int generation, GrayQueue *queue);
 static gboolean need_major_collection (mword space_needed);
 static void major_collection (const char *reason);
+
+static gboolean collection_is_parallel (void);
 
 static void mono_gc_register_disappearing_link (MonoObject *obj, void **link, gboolean track, gboolean in_gc);
 static gboolean mono_gc_is_critical_method (MonoMethod *method);
@@ -1017,6 +1029,18 @@ mono_gc_get_bitmap_for_descr (void *descr, int *numbits)
 
 		*numbits = first_set + num_set;
 
+		return bitmap;
+	}
+	case DESC_TYPE_LARGE_BITMAP: {
+		gsize bmap = (d >> LOW_TYPE_BITS) << OBJECT_HEADER_WORDS;
+
+		bitmap = g_new0 (gsize, 1);
+		bitmap [0] = bmap;
+		*numbits = 0;
+		while (bmap) {
+			(*numbits) ++;
+			bmap >>= 1;
+		}
 		return bitmap;
 	}
 	default:
@@ -1577,7 +1601,7 @@ void
 mono_sgen_add_to_global_remset (gpointer ptr)
 {
 	RememberedSet *rs;
-	gboolean lock = major_collector.is_parallel;
+	gboolean lock = collection_is_parallel ();
 
 	if (use_cardtable) {
 		sgen_card_table_mark_address ((mword)ptr);
@@ -1637,17 +1661,19 @@ drain_gray_stack (GrayQueue *queue, int max_objs)
 	char *obj;
 
 	if (current_collection_generation == GENERATION_NURSERY) {
+		ScanObjectFunc scan_func = mono_sgen_get_minor_scan_object ();
+
 		for (;;) {
 			GRAY_OBJECT_DEQUEUE (queue, obj);
 			if (!obj)
 				return TRUE;
 			DEBUG (9, fprintf (gc_debug_file, "Precise gray object scan %p (%s)\n", obj, safe_name (obj)));
-			major_collector.minor_scan_object (obj, queue);
+			scan_func (obj, queue);
 		}
 	} else {
 		int i;
 
-		if (major_collector.is_parallel && queue == &workers_distribute_gray_queue)
+		if (collection_is_parallel () && queue == &workers_distribute_gray_queue)
 			return TRUE;
 
 		do {
@@ -1786,7 +1812,7 @@ mono_sgen_pin_objects_in_section (GCMemSection *section, GrayQueue *queue)
 void
 mono_sgen_pin_object (void *object, GrayQueue *queue)
 {
-	if (major_collector.is_parallel) {
+	if (collection_is_parallel ()) {
 		LOCK_PIN_QUEUE;
 		/*object arrives pinned*/
 		pin_stage_ptr (object);
@@ -2340,6 +2366,41 @@ bridge_register_finalized_object (MonoObject *object)
 	finalized_array [finalized_array_entries++] = object;
 }
 
+CopyOrMarkObjectFunc
+mono_sgen_get_copy_object (void)
+{
+	if (current_collection_generation == GENERATION_NURSERY) {
+		if (collection_is_parallel ())
+			return major_collector.copy_object;
+		else
+			return major_collector.nopar_copy_object;
+	} else {
+		return major_collector.copy_or_mark_object;
+	}
+}
+
+ScanObjectFunc
+mono_sgen_get_minor_scan_object (void)
+{
+	g_assert (current_collection_generation == GENERATION_NURSERY);
+
+	if (collection_is_parallel ())
+		return major_collector.minor_scan_object;
+	else
+		return major_collector.nopar_minor_scan_object;
+}
+
+ScanVTypeFunc
+mono_sgen_get_minor_scan_vtype (void)
+{
+	g_assert (current_collection_generation == GENERATION_NURSERY);
+
+	if (collection_is_parallel ())
+		return major_collector.minor_scan_vtype;
+	else
+		return major_collector.nopar_minor_scan_vtype;
+}
+
 static void
 finish_gray_stack (char *start_addr, char *end_addr, int generation, GrayQueue *queue)
 {
@@ -2348,7 +2409,7 @@ finish_gray_stack (char *start_addr, char *end_addr, int generation, GrayQueue *
 	int fin_ready;
 	int ephemeron_rounds = 0;
 	int num_loops;
-	CopyOrMarkObjectFunc copy_func = current_collection_generation == GENERATION_NURSERY ? major_collector.copy_object : major_collector.copy_or_mark_object;
+	CopyOrMarkObjectFunc copy_func = mono_sgen_get_copy_object ();
 
 	/*
 	 * We copied all the reachable objects. Now it's the time to copy
@@ -2620,7 +2681,7 @@ mono_sgen_register_moved_object (void *obj, void *destination)
 	g_assert (mono_profiler_events & MONO_PROFILE_GC_MOVES);
 
 	/* FIXME: handle this for parallel collector */
-	g_assert (!major_collector.is_parallel);
+	g_assert (!collection_is_parallel ());
 
 	if (moved_objects_idx == MOVED_OBJECTS_NUM) {
 		mono_profiler_gc_moves (moved_objects, moved_objects_idx);
@@ -2783,6 +2844,25 @@ gboolean
 mono_sgen_need_major_collection (mword space_needed)
 {
 	return need_major_collection (space_needed);
+}
+
+static gboolean
+collection_is_parallel (void)
+{
+	switch (current_collection_generation) {
+	case GENERATION_NURSERY:
+		return nursery_collection_is_parallel;
+	case GENERATION_OLD:
+		return major_collector.is_parallel;
+	default:
+		g_assert_not_reached ();
+	}
+}
+
+gboolean
+mono_sgen_nursery_collection_is_parallel (void)
+{
+	return nursery_collection_is_parallel;
 }
 
 static GrayQueue*
@@ -2957,7 +3037,7 @@ collect_nursery (size_t requested_size)
 		time_minor_scan_card_table += TV_ELAPSED_MS (atv, btv);
 	}
 
-	if (!major_collector.is_parallel)
+	if (!collection_is_parallel ())
 		drain_gray_stack (&gray_queue, -1);
 
 	if (mono_profiler_get_events () & MONO_PROFILE_GC_ROOTS)
@@ -2968,13 +3048,13 @@ collect_nursery (size_t requested_size)
 	time_minor_scan_pinned += TV_ELAPSED_MS (btv, atv);
 
 	/* registered roots, this includes static fields */
-	scrrjd_normal.func = major_collector.copy_object;
+	scrrjd_normal.func = collection_is_parallel () ? major_collector.copy_object : major_collector.nopar_copy_object;
 	scrrjd_normal.heap_start = nursery_start;
 	scrrjd_normal.heap_end = nursery_next;
 	scrrjd_normal.root_type = ROOT_TYPE_NORMAL;
 	workers_enqueue_job (job_scan_from_registered_roots, &scrrjd_normal);
 
-	scrrjd_wbarrier.func = major_collector.copy_object;
+	scrrjd_wbarrier.func = collection_is_parallel () ? major_collector.copy_object : major_collector.nopar_copy_object;
 	scrrjd_wbarrier.heap_start = nursery_start;
 	scrrjd_wbarrier.heap_end = nursery_next;
 	scrrjd_wbarrier.root_type = ROOT_TYPE_WBARRIER;
@@ -2992,7 +3072,7 @@ collect_nursery (size_t requested_size)
 	time_minor_scan_thread_data += TV_ELAPSED_MS (btv, atv);
 	btv = atv;
 
-	if (major_collector.is_parallel) {
+	if (collection_is_parallel ()) {
 		while (!gray_object_queue_is_empty (WORKERS_DISTRIBUTE_GRAY_QUEUE)) {
 			workers_distribute_gray_queue_sections ();
 			usleep (1000);
@@ -3000,7 +3080,7 @@ collect_nursery (size_t requested_size)
 	}
 	workers_join ();
 
-	if (major_collector.is_parallel)
+	if (collection_is_parallel ())
 		g_assert (gray_object_queue_is_empty (&gray_queue));
 
 	finish_gray_stack (nursery_start, nursery_next, GENERATION_NURSERY, &gray_queue);
@@ -3607,7 +3687,7 @@ mono_gc_alloc_obj_nolock (MonoVTable *vtable, size_t size)
 			DEBUG (6, fprintf (gc_debug_file, "Allocated object %p, vtable: %p (%s), size: %zd\n", p, vtable, vtable->klass->name, size));
 			binary_protocol_alloc (p , vtable, size);
 			g_assert (*p == NULL);
-			*p = vtable;
+			mono_atomic_store_seq (p, vtable);
 
 			return p;
 		}
@@ -3721,7 +3801,7 @@ mono_gc_alloc_obj_nolock (MonoVTable *vtable, size_t size)
 	if (G_LIKELY (p)) {
 		DEBUG (6, fprintf (gc_debug_file, "Allocated object %p, vtable: %p (%s), size: %zd\n", p, vtable, vtable->klass->name, size));
 		binary_protocol_alloc (p, vtable, size);
-		*p = vtable;
+		mono_atomic_store_seq (p, vtable);
 	}
 
 	return p;
@@ -3746,6 +3826,7 @@ mono_gc_try_alloc_obj_nolock (MonoVTable *vtable, size_t size)
 		if (!p)
 			return NULL;
 
+		/*FIXME we should use weak memory ops here. Should help specially on x86. */
 		if (nursery_clear_policy == CLEAR_AT_TLAB_CREATION)
 			memset (p, 0, size);
 	} else {
@@ -3798,18 +3879,14 @@ mono_gc_try_alloc_obj_nolock (MonoVTable *vtable, size_t size)
 		}
 	}
 
-	/* 
-	 * FIXME: We might need a memory barrier here so the change to tlab_next is 
-	 * visible before the vtable store.
-	 */
-
 	HEAVY_STAT (++stat_objects_alloced);
 	HEAVY_STAT (stat_bytes_alloced += size);
 
 	DEBUG (6, fprintf (gc_debug_file, "Allocated object %p, vtable: %p (%s), size: %zd\n", p, vtable, vtable->klass->name, size));
 	binary_protocol_alloc (p, vtable, size);
-	g_assert (*p == NULL);
-	*p = vtable;
+	g_assert (*p == NULL); /* FIXME disable this in non debug builds */
+
+	mono_atomic_store_seq (p, vtable);
 
 	return p;
 }
@@ -3845,6 +3922,7 @@ mono_gc_alloc_vector (MonoVTable *vtable, size_t size, uintptr_t max_length)
 	ENTER_CRITICAL_REGION;
 	arr = mono_gc_try_alloc_obj_nolock (vtable, size);
 	if (arr) {
+		/*This doesn't require fencing since EXIT_CRITICAL_REGION already does it for us*/
 		arr->max_length = max_length;
 		EXIT_CRITICAL_REGION;
 		return arr;
@@ -3900,6 +3978,7 @@ mono_gc_alloc_string (MonoVTable *vtable, size_t size, gint32 len)
 	ENTER_CRITICAL_REGION;
 	str = mono_gc_try_alloc_obj_nolock (vtable, size);
 	if (str) {
+		/*This doesn't require fencing since EXIT_CRITICAL_REGION already does it for us*/
 		str->length = len;
 		EXIT_CRITICAL_REGION;
 		return str;
@@ -3943,7 +4022,7 @@ mono_gc_alloc_pinned_obj (MonoVTable *vtable, size_t size)
 	if (G_LIKELY (p)) {
 		DEBUG (6, fprintf (gc_debug_file, "Allocated pinned object %p, vtable: %p (%s), size: %zd\n", p, vtable, vtable->klass->name, size));
 		binary_protocol_alloc_pinned (p, vtable, size);
-		*p = vtable;
+		mono_atomic_store_seq (p, vtable);
 	}
 	UNLOCK_GC;
 	return p;
@@ -3956,7 +4035,7 @@ mono_gc_alloc_mature (MonoVTable *vtable)
 	size_t size = ALIGN_UP (vtable->klass->instance_size);
 	LOCK_GC;
 	res = alloc_degraded (vtable, size);
-	*res = vtable;
+	mono_atomic_store_seq (res, vtable);
 	UNLOCK_GC;
 	if (G_UNLIKELY (vtable->klass->has_finalize))
 		mono_object_register_finalizer ((MonoObject*)res);
@@ -4778,10 +4857,14 @@ mono_gc_scan_object (void *obj)
 {
 	UserCopyOrMarkData *data = pthread_getspecific (user_copy_or_mark_key);
 
-	if (current_collection_generation == GENERATION_NURSERY)
-		major_collector.copy_object (&obj, data->queue);
-	else
+	if (current_collection_generation == GENERATION_NURSERY) {
+		if (collection_is_parallel ())
+			major_collector.copy_object (&obj, data->queue);
+		else
+			major_collector.nopar_copy_object (&obj, data->queue);
+	} else {
 		major_collector.copy_or_mark_object (&obj, data->queue);
+	}
 	return obj;
 }
 
@@ -4918,9 +5001,10 @@ handle_remset (mword *p, void *start_nursery, void *end_nursery, gboolean global
 		ptr = (void**)(*p & ~REMSET_TYPE_MASK);
 		if (((void*)ptr >= start_nursery && (void*)ptr < end_nursery))
 			return p + 1;
-		major_collector.minor_scan_object ((char*)ptr, queue);
+		mono_sgen_get_minor_scan_object () ((char*)ptr, queue);
 		return p + 1;
 	case REMSET_VTYPE: {
+		ScanVTypeFunc scan_vtype = mono_sgen_get_minor_scan_vtype ();
 		size_t skip_size;
 
 		ptr = (void**)(*p & ~REMSET_TYPE_MASK);
@@ -4930,7 +5014,7 @@ handle_remset (mword *p, void *start_nursery, void *end_nursery, gboolean global
 		count = p [2];
 		skip_size = p [3];
 		while (count-- > 0) {
-			major_collector.minor_scan_vtype ((char*)ptr, desc, queue);
+			scan_vtype ((char*)ptr, desc, queue);
 			ptr = (void**)((char*)ptr + skip_size);
 		}
 		return p + 4;
@@ -5457,7 +5541,7 @@ mono_gc_set_stack_end (void *stack_end)
 int
 mono_gc_pthread_create (pthread_t *new_thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
 {
-	return mono_threads_pthread_create (new_thread, attr, start_routine, arg);
+	return pthread_create (new_thread, attr, start_routine, arg);
 }
 
 int
@@ -6526,7 +6610,8 @@ mono_gc_base_init (void)
 	cb.thread_register = sgen_thread_register;
 	cb.thread_unregister = sgen_thread_unregister;
 	cb.thread_attach = sgen_thread_attach;
-	cb.mono_method_is_critical = is_critical_method;
+	cb.mono_method_is_critical = (gpointer)is_critical_method;
+	cb.mono_gc_pthread_create = (gpointer)mono_gc_pthread_create;
 
 	mono_threads_init (&cb, sizeof (SgenThreadInfo));
 
@@ -7057,6 +7142,10 @@ create_allocator (int atype)
 	mono_mb_emit_ldloc (mb, new_next_var);
 	mono_mb_emit_byte (mb, CEE_STIND_I);
 
+	/*The tlab store must be visible before the the vtable store. This could be replaced with a DDS but doing it with IL would be tricky. */
+	mono_mb_emit_byte ((mb), MONO_CUSTOM_PREFIX);
+	mono_mb_emit_op (mb, CEE_MONO_MEMORY_BARRIER, StoreStoreBarrier);
+
 	/* *p = vtable; */
 	mono_mb_emit_ldloc (mb, p_var);
 	mono_mb_emit_ldarg (mb, 0);
@@ -7069,6 +7158,12 @@ create_allocator (int atype)
 		mono_mb_emit_ldarg (mb, 1);
 		mono_mb_emit_byte (mb, CEE_STIND_I);
 	}
+
+	/*
+	We must make sure both vtable and max_length are globaly visible before returning to managed land.
+	*/
+	mono_mb_emit_byte ((mb), MONO_CUSTOM_PREFIX);
+	mono_mb_emit_op (mb, CEE_MONO_MEMORY_BARRIER, StoreStoreBarrier);
 
 	/* return p */
 	mono_mb_emit_ldloc (mb, p_var);

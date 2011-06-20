@@ -40,6 +40,7 @@ static MonoThreadInfoCallbacks threads_callbacks;
 static MonoThreadInfoRuntimeCallbacks runtime_callbacks;
 static MonoNativeTlsKey thread_info_key, small_id_key;
 static MonoLinkedListSet thread_list;
+static gboolean disable_new_interrupt = FALSE;
 
 static inline void
 mono_hazard_pointer_clear_all (MonoThreadHazardPointers *hp, int retain)
@@ -266,6 +267,12 @@ mono_threads_runtime_init (MonoThreadInfoRuntimeCallbacks *callbacks)
 	runtime_callbacks = *callbacks;
 }
 
+MonoThreadInfoCallbacks *
+mono_threads_get_callbacks (void)
+{
+	return &threads_callbacks;
+}
+
 MonoThreadInfoRuntimeCallbacks *
 mono_threads_get_runtime_callbacks (void)
 {
@@ -478,6 +485,11 @@ mono_thread_info_suspend_unlock (void)
 	LeaveCriticalSection (&global_suspend_lock);
 }
 
+void
+mono_thread_info_disable_new_interrupt (gboolean disable)
+{
+	disable_new_interrupt = disable;
+}
 /*
 Disabled by default for now.
 To enable this we need mini to implement the callbacks by MonoThreadInfoRuntimeCallbacks
@@ -488,14 +500,14 @@ mono_thread_info_new_interrupt_enabled (void)
 {
 	/*We need STW gc events to work correctly*/
 #if defined (HAVE_BOEHM_GC) && !defined (USE_INCLUDED_LIBGC)
-	return FALSE:
+	return FALSE;
 #endif
 	/*port not done*/
 #if defined(HOST_WIN32)
 	return FALSE;
 #endif
 #if defined (__i386__)
-	return TRUE;
+	return !disable_new_interrupt;
 #endif
 	return FALSE;
 }

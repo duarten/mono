@@ -374,7 +374,9 @@ BASE_TEST_CS_SRC=		\
 	dynamic-method-resurrection.cs	\
 	bug-666008.cs	\
 	bug-685908.cs	\
-	sgen-long-vtype.cs
+	sgen-long-vtype.cs	\
+	delegate-invoke.cs	\
+	bug-696593.cs
 
 TEST_CS_SRC_DIST=	\
 	$(BASE_TEST_CS_SRC)	\

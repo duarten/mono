@@ -1505,6 +1505,12 @@ namespace Mono.CSharp {
 			}
 		}
 
+		public override bool IsGenericTask {
+			get {
+				return (open_type.state & StateFlags.GenericTask) != 0;
+			}
+		}
+
 		public override bool IsNullableType {
 			get {
 				return (open_type.state & StateFlags.InflatedNullableType) != 0;
@@ -3047,6 +3053,11 @@ namespace Mono.CSharp {
 
 			fixed_types[i] = best_candidate;
 			return true;
+		}
+
+		public bool HasBounds (int pos)
+		{
+			return bounds[pos] != null;
 		}
 		
 		//
