@@ -493,7 +493,7 @@ namespace Mono.CSharp
 				
 			case Operator.UnaryNegation:
 				if (ec.HasSet (EmitContext.Options.CheckedScope) && !IsFloat (type)) {
-					ec.Emit (OpCodes.Ldc_I4_0);
+					ec.EmitInt (0);
 					if (type.BuiltinType == BuiltinTypeSpec.Type.Long)
 						ec.Emit (OpCodes.Conv_U8);
 					Expr.Emit (ec);
@@ -507,7 +507,7 @@ namespace Mono.CSharp
 				
 			case Operator.LogicalNot:
 				Expr.Emit (ec);
-				ec.Emit (OpCodes.Ldc_I4_0);
+				ec.EmitInt (0);
 				ec.Emit (OpCodes.Ceq);
 				break;
 				
@@ -1340,7 +1340,7 @@ namespace Mono.CSharp
 				ec.Emit (OpCodes.Box, expr.Type);
 
 			ec.Emit (OpCodes.Isinst, probe_type_expr);
-			ec.Emit (OpCodes.Ldnull);
+			ec.EmitNull ();
 			ec.Emit (OpCodes.Cgt_Un);
 		}
 
@@ -1678,6 +1678,12 @@ namespace Mono.CSharp
 		{
 			this.expr = expr;
 			this.loc = loc;
+		}
+
+		public override bool IsSideEffectFree {
+			get {
+				return true;
+			}
 		}
 
 		public override Expression CreateExpressionTree (ResolveContext ec)
@@ -2379,7 +2385,7 @@ namespace Mono.CSharp
 
 			case Operator.Inequality:
 				ec.Emit (OpCodes.Ceq);
-				ec.Emit (OpCodes.Ldc_I4_0);
+				ec.EmitInt (0);
 				
 				opcode = OpCodes.Ceq;
 				break;
@@ -2403,7 +2409,7 @@ namespace Mono.CSharp
 					ec.Emit (OpCodes.Cgt_Un);
 				else
 					ec.Emit (OpCodes.Cgt);
-				ec.Emit (OpCodes.Ldc_I4_0);
+				ec.EmitInt (0);
 				
 				opcode = OpCodes.Ceq;
 				break;
@@ -2414,7 +2420,7 @@ namespace Mono.CSharp
 				else
 					ec.Emit (OpCodes.Clt);
 				
-				ec.Emit (OpCodes.Ldc_I4_0);
+				ec.EmitInt (0);
 				
 				opcode = OpCodes.Ceq;
 				break;
@@ -3755,7 +3761,11 @@ namespace Mono.CSharp
 				ec.Emit (OpCodes.Br_S, end);
 				
 				ec.MarkLabel (load_result);
-				ec.Emit (is_or ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0);
+				if (is_or)
+					ec.EmitInt (1);
+				else
+					ec.EmitInt (0);
+
 				ec.MarkLabel (end);
 				return;
 			}
@@ -4430,13 +4440,6 @@ namespace Mono.CSharp
 			expr.EmitBranchable (ec, false_target, false);
 			true_expr.Emit (ec);
 
-			if (type.IsInterface) {
-				LocalBuilder temp = ec.GetTemporaryLocal (type);
-				ec.Emit (OpCodes.Stloc, temp);
-				ec.Emit (OpCodes.Ldloc, temp);
-				ec.FreeTemporaryLocal (temp, type);
-			}
-
 			ec.Emit (OpCodes.Br, end_target);
 			ec.MarkLabel (false_target);
 			false_expr.Emit (ec);
@@ -4978,22 +4981,6 @@ namespace Mono.CSharp
 
 			SetAssigned (ec);
 			return base.DoResolveLValue (ec, right_side);
-		}
-
-		static public void EmitLdArg (EmitContext ec, int x)
-		{
-			switch (x) {
-			case 0: ec.Emit (OpCodes.Ldarg_0); break;
-			case 1: ec.Emit (OpCodes.Ldarg_1); break;
-			case 2: ec.Emit (OpCodes.Ldarg_2); break;
-			case 3: ec.Emit (OpCodes.Ldarg_3); break;
-			default:
-				if (x > byte.MaxValue)
-					ec.Emit (OpCodes.Ldarg, x);
-				else
-					ec.Emit (OpCodes.Ldarg_S, (byte) x);
-				break;
-			}
 		}
 	}
 	
@@ -6683,7 +6670,7 @@ namespace Mono.CSharp
 
 			public void Emit (EmitContext ec)
 			{
-				ec.Emit (OpCodes.Ldarg_0);
+				ec.EmitThis ();
 			}
 
 			public void EmitAssign (EmitContext ec)
@@ -6693,7 +6680,7 @@ namespace Mono.CSharp
 
 			public void EmitAddressOf (EmitContext ec)
 			{
-				ec.Emit (OpCodes.Ldarg_0);
+				ec.EmitThis ();
 			}
 		}
 
@@ -6720,6 +6707,12 @@ namespace Mono.CSharp
 
 		public override bool IsRef {
 			get { return type.IsStruct; }
+		}
+
+		public override bool IsSideEffectFree {
+			get {
+				return true;
+			}
 		}
 
 		protected override ILocalVariable Variable {
@@ -7088,6 +7081,13 @@ namespace Mono.CSharp
 		}
 
 		#region Properties
+
+		public override bool IsSideEffectFree {
+			get {
+				return true;
+			}
+		}
+
 		public TypeSpec TypeArgument {
 			get {
 				return typearg;
@@ -7254,6 +7254,12 @@ namespace Mono.CSharp
 			this.loc = loc;
 		}
 
+		public override bool IsSideEffectFree {
+			get {
+				return true;
+			}
+		}
+
 		public override Expression CreateExpressionTree (ResolveContext ec)
 		{
 			Arguments args = new Arguments (2);
@@ -7332,6 +7338,12 @@ namespace Mono.CSharp
 		{
 			this.QueriedType = queried_type;
 			loc = l;
+		}
+
+		public override bool IsSideEffectFree {
+			get {
+				return true;
+			}
 		}
 
 		public override Expression CreateExpressionTree (ResolveContext ec)

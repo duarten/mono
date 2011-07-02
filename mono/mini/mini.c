@@ -77,7 +77,9 @@ static gboolean default_opt_set = FALSE;
 
 guint32 mono_jit_tls_id = -1;
 
+#ifdef MONO_HAVE_FAST_TLS
 MONO_FAST_TLS_DECLARE(mono_jit_tls);
+#endif
 
 #ifndef MONO_ARCH_MONITOR_ENTER_ADJUSTMENT
 #define MONO_ARCH_MONITOR_ENTER_ADJUSTMENT 1
@@ -3076,7 +3078,7 @@ mono_resolve_patch_target (MonoMethod *method, MonoDomain *domain, guint8 *code,
 			if (run_cctors)
 				mono_runtime_class_init (vtable);
 		}
-		target = (char*)vtable->data + patch_info->data.field->offset;
+		target = (char*)mono_vtable_get_static_field_data (vtable) + patch_info->data.field->offset;
 		break;
 	}
 	case MONO_PATCH_INFO_RVA: {

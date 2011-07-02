@@ -187,7 +187,7 @@ namespace Mono.CSharp
 			var type = Expr.Type;
 			if (IsByRef) {
 				var ml = (IMemoryLocation) Expr;
-				ml.AddressOf (ec, AddressOp.Load);
+				ml.AddressOf (ec, AddressOp.LoadStore);
 				type = ReferenceContainer.MakeType (ec.Module, type);
 			} else {
 				Expr.Emit (ec);
@@ -497,9 +497,9 @@ namespace Mono.CSharp
 		public Arguments MarkOrderedArgument (NamedArgument a)
 		{
 			//
-			// Constant expression have no effect on left-to-right execution
+			// An expression has no effect on left-to-right execution
 			//
-			if (a.Expr is Constant)
+			if (a.Expr.IsSideEffectFree)
 				return this;
 
 			ArgumentsOrdered ra = this as ArgumentsOrdered;

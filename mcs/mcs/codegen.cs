@@ -87,6 +87,8 @@ namespace Mono.CSharp
 
 		DynamicSiteClass dynamic_site_container;
 
+		TypeSpec[] stack_types;
+
 		public EmitContext (IMemberContext rc, ILGenerator ig, TypeSpec return_type)
 		{
 			this.member_context = rc;
@@ -156,6 +158,26 @@ namespace Mono.CSharp
 				return return_type;
 			}
 		}
+
+		public int StackHeight {
+			get {
+#if STATIC
+				return ig.__StackHeight;
+#else
+				throw new NotImplementedException ();
+#endif
+			}
+		}
+
+		//
+		// Enabled when tracking stack types during emit phase
+		//
+		bool TrackStackTypes {
+			get {
+				return (flags & Options.AsyncBody) != 0;
+			}
+		}
+
 		#endregion
 
 		/// <summary>
@@ -249,36 +271,88 @@ namespace Mono.CSharp
 		public void Emit (OpCode opcode)
 		{
 			ig.Emit (opcode);
+
+			if (TrackStackTypes) {
+				switch (opcode.StackBehaviourPush) {
+				case StackBehaviour.Push0:
+					// Nothing
+					break;
+				case StackBehaviour.Pushi:
+					SetStackType (Module.Compiler.BuiltinTypes.Int);
+					break;
+				case StackBehaviour.Pushi8:
+					SetStackType (Module.Compiler.BuiltinTypes.Long);
+					break;
+				case StackBehaviour.Pushr4:
+					SetStackType (Module.Compiler.BuiltinTypes.Float);
+					break;
+				case StackBehaviour.Pushr8:
+					SetStackType (Module.Compiler.BuiltinTypes.Double);
+					break;
+				case StackBehaviour.Push1:
+					if (opcode.StackBehaviourPop == StackBehaviour.Pop1) {
+						// nothing
+					} else if (opcode.StackBehaviourPop == StackBehaviour.Pop1_pop1) {
+						// nothing
+					} else {
+						throw new NotImplementedException (opcode.Name);
+					}
+					break;
+				case StackBehaviour.Push1_push1:
+					if (opcode.StackBehaviourPop == StackBehaviour.Pop1) {
+						SetStackType (stack_types[StackHeight - 2]);
+					} else {
+						throw new NotImplementedException (opcode.Name);
+					}
+					break;
+				default:
+					throw new NotImplementedException (opcode.Name);
+				}
+			}
 		}
 
-		public void Emit (OpCode opcode, LocalBuilder local)
+		public void Emit (OpCode opcode, LocalBuilder local, TypeSpec type)
 		{
 			ig.Emit (opcode, local);
+
+			if (TrackStackTypes) {
+				if (opcode.StackBehaviourPush == StackBehaviour.Push0) {
+					// Nothing
+				} else if (opcode.StackBehaviourPush == StackBehaviour.Push1) {
+					SetStackType (type);
+				} else if (opcode.StackBehaviourPush == StackBehaviour.Pushi) {
+					SetStackType (ReferenceContainer.MakeType (Module, type));
+				} else {
+					throw new NotImplementedException (opcode.Name);
+				}
+			}
 		}
 
 		public void Emit (OpCode opcode, string arg)
 		{
 			ig.Emit (opcode, arg);
+
+			if (TrackStackTypes) {
+				SetStackType (Module.Compiler.BuiltinTypes.String);
+			}
 		}
 
 		public void Emit (OpCode opcode, double arg)
 		{
 			ig.Emit (opcode, arg);
+
+			if (TrackStackTypes) {
+				SetStackType (Module.Compiler.BuiltinTypes.Double);
+			}
 		}
 
 		public void Emit (OpCode opcode, float arg)
 		{
 			ig.Emit (opcode, arg);
-		}
 
-		public void Emit (OpCode opcode, int arg)
-		{
-			ig.Emit (opcode, arg);
-		}
-
-		public void Emit (OpCode opcode, byte arg)
-		{
-			ig.Emit (opcode, arg);
+			if (TrackStackTypes) {
+				SetStackType (Module.Compiler.BuiltinTypes.Float);
+			}
 		}
 
 		public void Emit (OpCode opcode, Label label)
@@ -297,6 +371,29 @@ namespace Mono.CSharp
 				type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
 
 			ig.Emit (opcode, type.GetMetaInfo ());
+
+			if (TrackStackTypes) {
+				switch (opcode.StackBehaviourPush) {
+				case StackBehaviour.Push0:
+					// Nothing
+					break;
+				case StackBehaviour.Pushi:
+					SetStackType (ReferenceContainer.MakeType (Module, type));
+					break;
+				case StackBehaviour.Push1:
+					SetStackType (type);
+					break;
+				default:
+					if (opcode == OpCodes.Box) {
+						SetStackType (Module.Compiler.BuiltinTypes.Object);
+					} else if (opcode == OpCodes.Castclass) {
+						SetStackType (type);
+					} else {
+						throw new NotImplementedException (opcode.Name);
+					}
+					break;
+				}
+			}
 		}
 
 		public void Emit (OpCode opcode, FieldSpec field)
@@ -305,6 +402,22 @@ namespace Mono.CSharp
 				field = field.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 			ig.Emit (opcode, field.GetMetaInfo ());
+
+			if (TrackStackTypes) {
+				switch (opcode.StackBehaviourPush) {
+				case StackBehaviour.Push0:
+					// nothing
+					break;
+				case StackBehaviour.Push1:
+					SetStackType (field.MemberType);
+					break;
+				case StackBehaviour.Pushi:
+					SetStackType (ReferenceContainer.MakeType (Module, field.MemberType));
+					break;
+				default:
+					throw new NotImplementedException ();
+				}
+			}
 		}
 
 		public void Emit (OpCode opcode, MethodSpec method)
@@ -316,6 +429,20 @@ namespace Mono.CSharp
 				ig.Emit (opcode, (ConstructorInfo) method.GetMetaInfo ());
 			else
 				ig.Emit (opcode, (MethodInfo) method.GetMetaInfo ());
+
+			if (TrackStackTypes) {
+				//
+				// Don't bother with ldftn/Ldvirtftn they can never appear on open stack
+				//
+				if (method.IsConstructor) {
+					if (opcode == OpCodes.Newobj)
+						SetStackType (method.DeclaringType);
+				} else {
+					if (method.ReturnType.Kind != MemberKind.Void) {
+						SetStackType (method.ReturnType);
+					}
+				}
+			}
 		}
 
 		// TODO: REMOVE breaks mutator
@@ -333,12 +460,20 @@ namespace Mono.CSharp
 		public void EmitArrayNew (ArrayContainer ac)
 		{
 			if (ac.Rank == 1) {
-				Emit (OpCodes.Newarr, ac.Element);
+				var type = IsAnonymousStoreyMutateRequired ?
+					CurrentAnonymousMethod.Storey.Mutator.Mutate (ac.Element) :
+					ac.Element;
+
+				ig.Emit (OpCodes.Newarr, type.GetMetaInfo ());
 			} else {
 				if (IsAnonymousStoreyMutateRequired)
 					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 				ig.Emit (OpCodes.Newobj, ac.GetConstructor ());
+			}
+
+			if (TrackStackTypes) {
+				SetStackType (ac);
 			}
 		}
 
@@ -349,8 +484,20 @@ namespace Mono.CSharp
 					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 				ig.Emit (OpCodes.Call, ac.GetAddressMethod ());
+
+				if (TrackStackTypes) {
+					SetStackType (ReferenceContainer.MakeType (Module, ac.Element));
+				}
 			} else {
-				Emit (OpCodes.Ldelema, ac.Element);
+				var type = IsAnonymousStoreyMutateRequired ?
+					CurrentAnonymousMethod.Storey.Mutator.Mutate (ac.Element) :
+					ac.Element;
+
+				ig.Emit (OpCodes.Ldelema, type.GetMetaInfo ());
+
+				if (TrackStackTypes) {
+					SetStackType (ReferenceContainer.MakeType (Module, type));
+				}
 			}
 		}
 
@@ -364,8 +511,14 @@ namespace Mono.CSharp
 					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 				ig.Emit (OpCodes.Call, ac.GetGetMethod ());
+
+				if (TrackStackTypes) {
+					SetStackType (ac.Element);
+				}
+
 				return;
 			}
+
 
 			var type = ac.Element;
 			if (type.Kind == MemberKind.Enum)
@@ -374,53 +527,64 @@ namespace Mono.CSharp
 			switch (type.BuiltinType) {
 			case BuiltinTypeSpec.Type.Byte:
 			case BuiltinTypeSpec.Type.Bool:
-				Emit (OpCodes.Ldelem_U1);
-				return;
+				ig.Emit (OpCodes.Ldelem_U1);
+				break;
 			case BuiltinTypeSpec.Type.SByte:
-				Emit (OpCodes.Ldelem_I1);
-				return;
+				ig.Emit (OpCodes.Ldelem_I1);
+				break;
 			case BuiltinTypeSpec.Type.Short:
-				Emit (OpCodes.Ldelem_I2);
-				return;
+				ig.Emit (OpCodes.Ldelem_I2);
+				break;
 			case BuiltinTypeSpec.Type.UShort:
 			case BuiltinTypeSpec.Type.Char:
-				Emit (OpCodes.Ldelem_U2);
-				return;
+				ig.Emit (OpCodes.Ldelem_U2);
+				break;
 			case BuiltinTypeSpec.Type.Int:
-				Emit (OpCodes.Ldelem_I4);
-				return;
+				ig.Emit (OpCodes.Ldelem_I4);
+				break;
 			case BuiltinTypeSpec.Type.UInt:
-				Emit (OpCodes.Ldelem_U4);
-				return;
+				ig.Emit (OpCodes.Ldelem_U4);
+				break;
 			case BuiltinTypeSpec.Type.ULong:
 			case BuiltinTypeSpec.Type.Long:
-				Emit (OpCodes.Ldelem_I8);
-				return;
+				ig.Emit (OpCodes.Ldelem_I8);
+				break;
 			case BuiltinTypeSpec.Type.Float:
-				Emit (OpCodes.Ldelem_R4);
-				return;
+				ig.Emit (OpCodes.Ldelem_R4);
+				break;
 			case BuiltinTypeSpec.Type.Double:
-				Emit (OpCodes.Ldelem_R8);
-				return;
+				ig.Emit (OpCodes.Ldelem_R8);
+				break;
 			case BuiltinTypeSpec.Type.IntPtr:
-				Emit (OpCodes.Ldelem_I);
-				return;
-			}
-
-			switch (type.Kind) {
-			case MemberKind.Struct:
-				Emit (OpCodes.Ldelema, type);
-				Emit (OpCodes.Ldobj, type);
-				break;
-			case MemberKind.TypeParameter:
-				Emit (OpCodes.Ldelem, type);
-				break;
-			case MemberKind.PointerType:
-				Emit (OpCodes.Ldelem_I);
+				ig.Emit (OpCodes.Ldelem_I);
 				break;
 			default:
-				Emit (OpCodes.Ldelem_Ref);
+				switch (type.Kind) {
+				case MemberKind.Struct:
+					if (IsAnonymousStoreyMutateRequired)
+						type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+					ig.Emit (OpCodes.Ldelema, type.GetMetaInfo ());
+					ig.Emit (OpCodes.Ldobj, type.GetMetaInfo ());
+					break;
+				case MemberKind.TypeParameter:
+					if (IsAnonymousStoreyMutateRequired)
+						type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+					ig.Emit (OpCodes.Ldelem, type.GetMetaInfo ());
+					break;
+				case MemberKind.PointerType:
+					ig.Emit (OpCodes.Ldelem_I);
+					break;
+				default:
+					ig.Emit (OpCodes.Ldelem_Ref);
+					break;
+				}
 				break;
+			}
+
+			if (TrackStackTypes) {
+				SetStackType (type);
 			}
 		}
 
@@ -487,6 +651,15 @@ namespace Mono.CSharp
 
 		public void EmitInt (int i)
 		{
+			EmitIntConstant (i);
+
+			if (TrackStackTypes) {
+				SetStackType (Module.Compiler.BuiltinTypes.Int);
+			}
+		}
+
+		void EmitIntConstant (int i)
+		{
 			switch (i) {
 			case -1:
 				ig.Emit (OpCodes.Ldc_I4_M1);
@@ -540,18 +713,18 @@ namespace Mono.CSharp
 		public void EmitLong (long l)
 		{
 			if (l >= int.MinValue && l <= int.MaxValue) {
-				EmitInt (unchecked ((int) l));
+				EmitIntConstant (unchecked ((int) l));
 				ig.Emit (OpCodes.Conv_I8);
-				return;
-			}
-
-			if (l >= 0 && l <= uint.MaxValue) {
-				EmitInt (unchecked ((int) l));
+			} else if (l >= 0 && l <= uint.MaxValue) {
+				EmitIntConstant (unchecked ((int) l));
 				ig.Emit (OpCodes.Conv_U8);
-				return;
+			} else {
+				ig.Emit (OpCodes.Ldc_I8, l);
 			}
 
-			ig.Emit (OpCodes.Ldc_I8, l);
+			if (TrackStackTypes) {
+				SetStackType (Module.Compiler.BuiltinTypes.Long);
+			}
 		}
 
 		//
@@ -565,51 +738,124 @@ namespace Mono.CSharp
 			switch (type.BuiltinType) {
 			case BuiltinTypeSpec.Type.Int:
 				ig.Emit (OpCodes.Ldind_I4);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.UInt:
 				ig.Emit (OpCodes.Ldind_U4);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.Short:
 				ig.Emit (OpCodes.Ldind_I2);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.UShort:
 			case BuiltinTypeSpec.Type.Char:
 				ig.Emit (OpCodes.Ldind_U2);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.Byte:
 				ig.Emit (OpCodes.Ldind_U1);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.SByte:
 			case BuiltinTypeSpec.Type.Bool:
 				ig.Emit (OpCodes.Ldind_I1);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.ULong:
 			case BuiltinTypeSpec.Type.Long:
 				ig.Emit (OpCodes.Ldind_I8);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.Float:
 				ig.Emit (OpCodes.Ldind_R4);
-				return;
+				break;
 			case BuiltinTypeSpec.Type.Double:
 				ig.Emit (OpCodes.Ldind_R8);
-				return;
-			case BuiltinTypeSpec.Type.IntPtr:
-				ig.Emit (OpCodes.Ldind_I);
-				return;
-			}
-
-			switch (type.Kind) {
-			case MemberKind.Struct:
-			case MemberKind.TypeParameter:
-				Emit (OpCodes.Ldobj, type);
 				break;
-			case MemberKind.PointerType:
+			case BuiltinTypeSpec.Type.IntPtr:
 				ig.Emit (OpCodes.Ldind_I);
 				break;
 			default:
-				ig.Emit (OpCodes.Ldind_Ref);
+				switch (type.Kind) {
+				case MemberKind.Struct:
+				case MemberKind.TypeParameter:
+					if (IsAnonymousStoreyMutateRequired)
+						type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+					ig.Emit (OpCodes.Ldobj, type.GetMetaInfo ());
+					break;
+				case MemberKind.PointerType:
+					ig.Emit (OpCodes.Ldind_I);
+					break;
+				default:
+					ig.Emit (OpCodes.Ldind_Ref);
+					break;
+				}
 				break;
 			}
+
+			if (TrackStackTypes) {
+				// TODO: test for async when `this' can be used inside structs
+				SetStackType (type);
+			}
+		}
+
+		public void EmitNull ()
+		{
+			ig.Emit (OpCodes.Ldnull);
+
+			if (TrackStackTypes) {
+				SetStackType (Module.Compiler.BuiltinTypes.Object);
+			}
+		}
+
+		public void EmitArgumentAddress (int pos)
+		{
+			if (!IsStatic)
+				++pos;
+
+			if (pos > byte.MaxValue)
+				ig.Emit (OpCodes.Ldarga, pos);
+			else
+				ig.Emit (OpCodes.Ldarga_S, (byte) pos);
+
+			if (TrackStackTypes) {
+				//
+				// Should never be reached, all parameters are hoisted into class
+				//
+				throw new NotImplementedException ();
+			}
+		}
+
+		public void EmitArgumentLoad (int pos)
+		{
+			if (!IsStatic)
+				++pos;
+
+			switch (pos) {
+			case 0: ig.Emit (OpCodes.Ldarg_0); break;
+			case 1: ig.Emit (OpCodes.Ldarg_1); break;
+			case 2: ig.Emit (OpCodes.Ldarg_2); break;
+			case 3: ig.Emit (OpCodes.Ldarg_3); break;
+			default:
+				if (pos > byte.MaxValue)
+					ig.Emit (OpCodes.Ldarg, pos);
+				else
+					ig.Emit (OpCodes.Ldarg_S, (byte) pos);
+				break;
+			}
+
+			if (TrackStackTypes) {
+				//
+				// Should never be reached, all parameters are hoisted into class
+				//
+				throw new NotImplementedException ();
+			}
+		}
+
+		public void EmitArgumentStore (int pos)
+		{
+			if (!IsStatic)
+				++pos;
+
+			if (pos > byte.MaxValue)
+				ig.Emit (OpCodes.Starg, pos);
+			else
+				ig.Emit (OpCodes.Starg_S, (byte) pos);
 		}
 
 		//
@@ -650,10 +896,41 @@ namespace Mono.CSharp
 				return;
 			}
 
-			if (type.IsStruct || TypeManager.IsGenericParameter (type))
-				Emit (OpCodes.Stobj, type);
-			else
+			switch (type.Kind) {
+			case MemberKind.Struct:
+			case MemberKind.TypeParameter:
+				if (IsAnonymousStoreyMutateRequired)
+					type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+				ig.Emit (OpCodes.Stobj, type.GetMetaInfo ());
+				break;
+			default:
 				ig.Emit (OpCodes.Stind_Ref);
+				break;
+			}
+		}
+
+		public void EmitThis ()
+		{
+			ig.Emit (OpCodes.Ldarg_0);
+
+			if (TrackStackTypes) {
+				//
+				// Using CurrentTypeOnStack as a placeholder for CurrentType to allow
+				// optimizations based on `this' presence
+				//
+				SetStackType (InternalType.CurrentTypeOnStack);
+			}
+		}
+
+		//
+		// Returns actual stack types when stack types tracing is enabled
+		//
+		public TypeSpec[] GetStackTypes ()
+		{
+			TypeSpec[] types = new TypeSpec[StackHeight];
+			Array.Copy (stack_types, types, types.Length);
+			return types;
 		}
 
 		/// <summary>
@@ -698,6 +975,20 @@ namespace Mono.CSharp
 				temporary_storage [t] = s;
 			}
 			s.Push (b);
+		}
+
+		void SetStackType (TypeSpec type)
+		{
+			if (type == null)
+				throw new ArgumentNullException ("type");
+
+			if (stack_types == null) {
+				stack_types = new TypeSpec[8];
+			} else if (StackHeight > stack_types.Length) {
+				Array.Resize (ref stack_types, stack_types.Length * 2);
+			}
+
+			stack_types[StackHeight - 1] = type;
 		}
 
 		/// <summary>
