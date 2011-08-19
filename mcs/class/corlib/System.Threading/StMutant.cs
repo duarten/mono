@@ -22,337 +22,184 @@
 
 namespace System.Threading
 {
-    internal class StMutant : StWaitable
-    {
-        //
-        // The boolean state of the lock (signalled/non-signalled) is stored
-        // in the *head.next* field, as follows:
-        // - head.next == UNLOCKED: the lock is signalled and its queue is empty;
-        // - head.next == null: the lock is non-signalled and its queue is empty;
-        // - others: the lock isn't signalled and its queue is non-empty.
-        //
+	internal abstract class StMutant : StWaitable
+	{
+		/*
+		 * The boolean state of the mutant (signalled/non-signalled) is stored
+		 * in the *head.next* field, as follows:
+		 * - head.next == SET: the mutant is signalled and its queue is empty;
+		 * - head.next == null: the mutant is non-signalled and its queue is empty;
+		 * - head.next == INFLATED: the mutant is a SynchronizationEvent and is inflated;
+		 * - others: the mutant isn't signalled and its queue is non-empty.
+		 */
 
-        private static readonly StWaitBlock UNLOCKED = new StWaitBlock();
+		protected static readonly StWaitBlock SET = StWaitBlock.SENTINEL;
 
-        private volatile StWaitBlock head;
-        private volatile StWaitBlock tail;
+		protected volatile StWaitBlock head;
+		protected volatile StWaitBlock tail;
 
-        //
-        // The predecessor of a wait block that must be unlinked
-        // when the right conditions are met.
-        //
+		/*
+		 * The predecessor of a wait block that must be unlinked
+		 * when the right conditions are met.
+		 */
 
-        private volatile StWaitBlock toUnlink;
+		private volatile StWaitBlock toUnlink;
+		private readonly int spinCount;
 
-        private readonly int spinCount;
+		internal StMutant (bool initialState, int sc)
+		{
+			head = tail = new StWaitBlock ();
+			if (initialState) {
+				head.next = SET;
+			}
+			spinCount = Environment.ProcessorCount > 0 ? sc : 0;
+		}
 
-        internal StMutant (bool initialState, int sc)
-        {
-            head = tail = new StWaitBlock ();
-            if (initialState) {
-                head.next = UNLOCKED;
-            }
-            spinCount = Environment.ProcessorCount > 0 ? sc : 0;
-        }
+		internal override bool _AllowsAcquire {
+			get { return head.next == SET; }
+		}
 
-        internal override bool _AllowsAcquire {
-            get { return head.next == UNLOCKED; }
-        }
+		internal override void _UndoAcquire ()
+		{
+			_Release ();
+		}
 
-        internal override bool _TryAcquire ()
-        {
-            return (head.next == UNLOCKED &&
-                    Interlocked.CompareExchange (ref head.next, null, UNLOCKED) == UNLOCKED);
-        }
+		internal override StWaitBlock _WaitAnyPrologue (StParker pk, int key,
+		                                                ref StWaitBlock hint, ref int sc)
+		{
+			StWaitBlock wb = null;
+			do {
+				if (_TryAcquire ()) {
+					return null;
+				}
 
-        internal bool SlowTryAcquire (StCancelArgs cargs)
-        {
-            StWaitBlock wb = null, pred;
-            do {
-                if (head.next == UNLOCKED &&
-                    Interlocked.CompareExchange (ref head.next, null, UNLOCKED) == UNLOCKED) {
-                    return true;
-                }
+				if (wb == null) {
+					wb = new StWaitBlock (pk, WaitType.WaitAny, 1, key);
+				}
 
-                if (cargs.Timeout == 0) {
-                    return false;
-                }
+				if (EnqueueWaiter (wb, out hint)) {
+					sc = hint == head ? spinCount : 0;
+					return wb;
+				}
+				
+				if (head.next == INFLATED) {
+					return null;
+				}
+			} while (true);
+		}
 
-                if (wb == null) {
-                    wb = new StWaitBlock (WaitType.WaitAny);
-                }
+		internal override StWaitBlock _WaitAllPrologue (StParker pk, ref StWaitBlock hint,
+		                                                ref int sc)
+		{
+         if (_AllowsAcquire) {
+            return null;
+         }
+                
+			var wb = new StWaitBlock (pk, WaitType.WaitAll, 1, StParkStatus.StateChange);
+         
+         if (EnqueueWaiter (wb, out hint)) {
+            sc = hint == head ? spinCount : 0;
+            return wb;
+         }
 
-                //
-                // Do the necessary consistency checks before trying to insert
-                // the wait block in the lock's queue; if the queue is in a
-                // quiescent state, try to perform the insertion.
-                //
+         return null;
+		}
 
-                StWaitBlock t, tn;
-                if ((tn = (t = tail).next) == UNLOCKED) {
-                    continue;
-                }
-                if (tn != null) {
-                    AdvanceTail (t, tn);
-                    continue;
-                }
+		protected abstract bool EnqueueWaiter (StWaitBlock wb, out StWaitBlock pred);
+		
+		internal override void _CancelAcquire (StWaitBlock wb, StWaitBlock hint)
+		{
+			while (hint.next == wb) {
 
-                if (Interlocked.CompareExchange (ref t.next, wb, null) == null) {
-                    AdvanceTail (t, wb);
+				/*
+				 * Remove the cancelled wait blocks that are at the front
+				 * of the queue.
+				 */
 
-                    //
-                    // Save the predecessor of the wait block and exit the loop.
-                    //
+				StWaitBlock h;
+				StWaitBlock hn = (h = head).next;
 
-                    pred = t;
-                    break;
-                }
-            }
-            while (true);
+				if (hn == INFLATED) {
+					return;
+				}
 
-            int ws = wb.parker.Park ((head == pred) ? spinCount : 0, cargs);
+				if (hn != null && hn != SET && hn.parker.IsLocked) {
+					TryAdvanceHead (h, hn);
+					continue;
+				}
 
-            if (ws == StParkStatus.Success) {
-                return true;
-            }
+				/*
+				 * If the queue is empty, return.
+				 */
 
-            Unlink (wb, pred);
-            StCancelArgs.ThrowIfException (ws);
-            return false;
-        }
+				StWaitBlock t, tn;
+				if ((t = tail) == h) {
+					return;
+				}
 
-        internal override bool _Release ()
-        {
-            do {
-                StWaitBlock h, hn;
-                if ((hn = (h = head).next) == UNLOCKED) {
-                    return true;
-                }
+				/*
+				 * Do the necessary consistency checks before trying to
+				 * unlink the wait block.
+				 */
 
-                if (hn == null) {
-                    if (Interlocked.CompareExchange (ref head.next, UNLOCKED, null) == null) {
-                        return false;
-                    }
-                    continue;
-                }
+				if ((tn = t.next) != null) {
+					AdvanceTail (t, tn);
+					continue;
+				}
 
-                if (AdvanceHead (h, hn)) {
-                    StParker pk;
-                    if ((pk = hn.parker).TryLock ()) {
-                        pk.Unpark (hn.waitKey);
+				/*
+				 * If the wait block is not at the tail of the queue, try
+				 * to unlink it.
+				 */
 
-                        //
-                        // If this is a wait-any wait block, we are done;
-                        // otherwise, keep trying to release another waiter.
-                        //
+				if (wb != t) {
+					StWaitBlock wbn;
+					if ((wbn = wb.next) == wb || hint.CasNext (wb, wbn)) {
+						return;
+					}
+				}
 
-                        if (hn.waitType == WaitType.WaitAny) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            while (true);
-        }
+				/*
+				 * The wait block is at the tail of the queue; so, take
+				 * into account the *toUnlink* wait block.
+				 */
 
-        internal override StWaitBlock _WaitAnyPrologue (StParker pk, int key,
-                                                        ref StWaitBlock hint, ref int sc)
-        {
-            StWaitBlock wb = null;
-            do {
-                if (head.next == UNLOCKED) {
-                    if (Interlocked.CompareExchange (ref head.next, null, UNLOCKED) == UNLOCKED) {
-                        if (pk.TryLock ()) {
-                            pk.UnparkSelf (key);
-                        }
-                        else {
+				StWaitBlock dp;
+				if ((dp = toUnlink) != null) {
+					StWaitBlock d, dn;
+					if ((d = dp.next) == dp ||
+					    ((dn = d.next) != null && dp.CasNext (d, dn))) {
+						CasToUnlink (dp, null);
+					}
+					if (dp == hint) {
+						return; // *wb* is an already the saved node.
+					}
+				} else if (CasToUnlink (null, hint)) {
+					return;
+				}
+			}
+		}
 
-                            //
-                            // The parker is already lock, which means that the
-                            // wait-any operation was already accomplished. So,
-                            // release the lock, undoing the previous acquire.
-                            //
+		protected void AdvanceTail (StWaitBlock t, StWaitBlock nt)
+		{
+			if (t == tail) {
+				Interlocked.CompareExchange (ref tail, nt, t);
+			}
+		}
 
-                            _Release ();
-                        }
-                        return null;
-                    }
-                    continue;
-                }
+		protected bool TryAdvanceHead (StWaitBlock h, StWaitBlock nh)
+		{
+			if (h == head && Interlocked.CompareExchange (ref head, nh, h) == h) {
+				h.next = h; // Mark the old head as unlinked.
+				return true;
+			}
+			return false;
+		}
 
-                if (wb == null) {
-                    wb = new StWaitBlock (pk, WaitType.WaitAny, 0, key);
-                }
-
-                StWaitBlock t, tn;
-                if ((tn = (t = tail).next) == UNLOCKED) {
-                    continue;
-                }
-                if (tn != null) {
-                    AdvanceTail (t, tn);
-                    continue;
-                }
-
-                if (Interlocked.CompareExchange (ref t.next, wb, null) == null) {
-                    AdvanceTail (t, wb);
-
-                    //
-                    // Return the inserted wait block, its predecessor and
-                    // the sugested spin count.
-                    //
-
-                    sc = ((hint = t) == head) ? spinCount : 0;
-                    return wb;
-                }
-            }
-            while (true);
-        }
-
-        internal override StWaitBlock _WaitAllPrologue (StParker pk, ref StWaitBlock hint,
-                                                        ref int sc)
-        {
-            StWaitBlock wb = null;
-            do {
-                //
-                // If the lock can be immediately acquired, lock our parker
-                // and if this is the last cooperative release, self unpark 
-                // the current thread.
-                //
-
-                if (_AllowsAcquire) {
-                    if (pk.TryLock ()) {
-                        pk.UnparkSelf (StParkStatus.StateChange);
-                    }
-                    return null;
-                }
-
-                if (wb == null) {
-                    wb = new StWaitBlock (pk, WaitType.WaitAll, 0, StParkStatus.StateChange);
-                }
-
-                StWaitBlock t, tn;
-                if ((tn = (t = tail).next) == UNLOCKED) {
-                    continue;
-                }
-                if (tn != null) {
-                    AdvanceTail (t, tn);
-                    continue;
-                }
-                if (Interlocked.CompareExchange (ref t.next, wb, null) == null) {
-                    AdvanceTail (t, wb);
-
-                    //
-                    // Return the inserted wait block, its predecessor and
-                    // the spin count for this wait block.
-                    //
-
-                    sc = ((hint = t) == head) ? spinCount : 0;
-                    return wb;
-                }
-            }
-            while (true);
-        }
-
-        internal override void _UndoAcquire ()
-        {
-            _Release ();
-        }
-
-        internal override void _CancelAcquire (StWaitBlock wb, StWaitBlock hint)
-        {
-            Unlink (wb, hint);
-        }
-
-        private void Unlink (StWaitBlock wb, StWaitBlock pred)
-        {
-            while (pred.next == wb) {
-                //
-                // Remove the cancelled wait blocks that are at the front
-                // of the queue.
-                //
-
-                StWaitBlock h, hn;
-                if (((hn = (h = head).next) != null && hn != UNLOCKED) &&
-                    (hn.parker.IsLocked && hn.request > 0)) {
-                    AdvanceHead (h, hn);
-                    continue;
-                }
-
-                //
-                // If the queue is empty, return.
-                //
-
-                StWaitBlock t, tn;
-                if ((t = tail) == h) {
-                    return;
-                }
-
-                //
-                // Do the necessary consistency checks before trying to
-                // unlink the wait block.
-                //
-
-                if (t != tail) {
-                    continue;
-                }
-
-                if ((tn = t.next) != null) {
-                    AdvanceTail (t, tn);
-                    continue;
-                }
-
-                //
-                // If the wait block is not at the tail of the queue, try
-                // to unlink it.
-                //
-
-                if (wb != t) {
-                    StWaitBlock wbn;
-                    if ((wbn = wb.next) == wb || pred.CasNext (wb, wbn)) {
-                        return;
-                    }
-                }
-
-                //
-                // The wait block is at the tail of the queue; so, take
-                // into account the *toUnlink* wait block.
-                //
-
-                StWaitBlock dp;
-                if ((dp = toUnlink) != null) {
-                    StWaitBlock d, dn;
-                    if ((d = dp.next) == dp || ((dn = d.next) != null && dp.CasNext (d, dn))) {
-                        CasToUnlink (dp, null);
-                    }
-                    if (dp == pred) {
-                        return; // *wb* is an already the saved node.
-                    }
-                }
-                else if (CasToUnlink (null, pred)) {
-                    return;
-                }
-            }
-        }
-
-        private bool AdvanceHead (StWaitBlock h, StWaitBlock nh)
-        {
-            if (h == head && Interlocked.CompareExchange (ref head, nh, h) == h) {
-                h.next = h; // Mark the old head as unlinked.
-                return true;
-            }
-            return false;
-        }
-
-        private void AdvanceTail (StWaitBlock t, StWaitBlock nt)
-        {
-            if (t == tail) {
-                Interlocked.CompareExchange (ref tail, nt, t);
-            }
-        }
-
-        private bool CasToUnlink (StWaitBlock tu, StWaitBlock ntu)
-        {
-            return toUnlink == tu && Interlocked.CompareExchange (ref toUnlink, ntu, tu) == tu;
-        }
-    }
+		private bool CasToUnlink (StWaitBlock tu, StWaitBlock ntu)
+		{
+			return toUnlink == tu &&
+			       Interlocked.CompareExchange (ref toUnlink, ntu, tu) == tu;
+		}
+	}
 }

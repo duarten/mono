@@ -173,7 +173,6 @@ libmonoruntime_la_SOURCES = \
 	opcodes.c		\
 	socket-io.c		\
 	socket-io.h		\
-	parkspot.c	\
 	parkspot.h	\
 	process.c		\
 	process.h		\
@@ -211,6 +210,8 @@ libmonoruntime_la_SOURCES = \
 	sgen-protocol.h		\
 	sgen-scan-object.h	\
 	sgen-nursery-allocator.c	\
+	st-handle.c	\
+	st-handle.h	\
 	string-icalls.c 	\
 	string-icalls.h 	\
 	sysmath.h		\

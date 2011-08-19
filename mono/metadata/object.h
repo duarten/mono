@@ -28,7 +28,7 @@ typedef struct _MonoAppContext MonoAppContext;
 
 typedef struct {
 	MonoVTable *vtable;
-	MonoThreadsSync *synchronisation;
+	volatile MonoThreadsSync *synchronisation;
 } MonoObject;
 
 typedef MonoObject* (*MonoInvokeFunc)	     (MonoMethod *method, void *obj, void **params, MonoObject **exc);

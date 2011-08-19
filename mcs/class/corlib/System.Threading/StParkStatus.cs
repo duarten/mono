@@ -18,14 +18,16 @@
 // Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 
-
 namespace System.Threading  
 {
-    internal static class StParkStatus {
-        internal const int Success = 0;
-        internal const int Timeout = -2;
-        internal const int Alerted = -3;
-        internal const int Interrupted = -4;
-        internal const int StateChange = Int32.MaxValue;
-    }
+	internal static class StParkStatus 
+	{
+      internal const int Success = 0;
+      internal const int Timeout = -2;
+		internal const int Interrupted = -3;
+		internal const int Cancelled = -4;
+      internal const int Pending = -5;
+		internal const int Inflated = -6;
+      internal const int StateChange = Int32.MaxValue;
+   }
 }

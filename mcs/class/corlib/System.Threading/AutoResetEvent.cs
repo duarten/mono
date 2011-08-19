@@ -4,6 +4,7 @@
 // Author:
 //   Dick Porter (dick@ximian.com)
 //   Veronica De Santis (veron78@interfree.it)
+//   Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 // (C) Ximian, Inc.  http://www.ximian.com
 //
@@ -31,8 +32,6 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 
-using System;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace System.Threading 
@@ -40,10 +39,15 @@ namespace System.Threading
 	[ComVisible (true)]
  	public sealed class AutoResetEvent : EventWaitHandle
 	{
-		// Constructor
+		private const int defaultSpinCount = 256;
+
 		public AutoResetEvent (bool initialState)
-			: base(initialState, EventResetMode.AutoReset)
+			: base (initialState, EventResetMode.AutoReset)
+		{ }
+
+		internal override StWaitable CreateWaitable ()
 		{
+			return new StSynchronizationEvent (false, defaultSpinCount);
 		}
 	}
 }

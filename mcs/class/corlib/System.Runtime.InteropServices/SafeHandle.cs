@@ -81,15 +81,17 @@ namespace System.Runtime.InteropServices
 		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
 		public void Close ()
 		{
-			if (refcount == 0)
-				throw new ObjectDisposedException (GetType ().FullName);
-
-			int newcount = 0, current = 0;
+			int newcount = 0;
 			bool registered = false;
 			RuntimeHelpers.PrepareConstrainedRegions ();
 			try {
 				do {
-					current = refcount;
+					int current;
+
+					if ((current = refcount) == 0) {
+						throw new ObjectDisposedException (GetType ().FullName);		
+					}
+
 					newcount = current-1;
 
 					// perform changes in finally to avoid async interruptions
@@ -120,16 +122,10 @@ namespace System.Runtime.InteropServices
 		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.MayFail)]
 		public void DangerousAddRef (ref bool success)
 		{
-			if (refcount <= 0)
-				throw new ObjectDisposedException (GetType ().FullName);
-
 			bool registered = false;
-			int newcount, current;
 			do {
-				current = refcount;
-				newcount = current + 1;
-				
-				if (current <= 0){
+				int current;
+				if ((current = refcount) <= 0){
 					//
 					// In MS, calling sf.Close () followed by a call
 					// to P/Invoke with SafeHandles throws this, but
@@ -138,6 +134,8 @@ namespace System.Runtime.InteropServices
 					//
 					throw new ObjectDisposedException (GetType ().FullName);
 				}
+
+				int newcount = current + 1;
 
 				// perform changes in finally to avoid async interruptions
 				RuntimeHelpers.PrepareConstrainedRegions ();

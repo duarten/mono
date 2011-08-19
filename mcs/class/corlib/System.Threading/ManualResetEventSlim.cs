@@ -1,21 +1,26 @@
-//
 // System.Threading.ManualResetEventSlim.cs
 //
-// Copyright 2011 Duarte Nunes
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-// http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright (c) 2008 Jérémie "Garuma" Laval
+// Copyright (c) 2011 Duarte Nunes
 //
-// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
 //
 
 #if NET_4_0 || MOBILE
@@ -25,9 +30,10 @@ namespace System.Threading
 	[Diagnostics.DebuggerDisplayAttribute ("Set = {IsSet}")]
 	public class ManualResetEventSlim : IDisposable
 	{
-		private const int defaultSpinCount = 100;
-
-		private readonly StNotificationEvent evt;
+		private const int defaultSpinCount = 256;
+		internal readonly StNotificationEvent evt;
+		private EventWaitHandle waitHandle;
+		private bool isDisposed;
 
 		public ManualResetEventSlim () 
             : this (false, defaultSpinCount) { }
@@ -37,10 +43,11 @@ namespace System.Threading
 
 		public ManualResetEventSlim (bool initialState, int spinCount)
 		{
-			if (spinCount < 0)
+			if (spinCount < 0) {
 				throw new ArgumentOutOfRangeException ("spinCount is less than 0", "spinCount");
+			}
 
-		    evt = new StNotificationEvent (initialState, spinCount);
+			evt = new StNotificationEvent (initialState, spinCount);
 		}
 
 		public bool IsSet {
@@ -48,28 +55,35 @@ namespace System.Threading
 		}
 
 		public int SpinCount {
-			get { return evt.waitEvent.spinCount; }
+			get { return evt.spinCount; }
 		}
 
-        //
-        // Just return a new EventWaitHandle. We're assuming that the object 
-        // will be short lived, so we don't hang on to it. The user might
-        // try to set the Handle/SafeWaitHandle properties, but that leads
-        // to undefined behavior so we don't even worry about it.
-        //
+		/*
+		 * If a user disposes of the WaitHandle, the behavior is undefined.
+		 */
 
 		public WaitHandle WaitHandle {
-			get { return new EventWaitHandle (evt); }
+			get {
+				ThrowIfDisposed ();
+				EventWaitHandle mre;
+				if ((mre = waitHandle) == null) {
+					mre = new EventWaitHandle (evt);
+					mre = Interlocked.CompareExchange (ref waitHandle, mre, null) ?? mre;
+				}
+				return mre;
+			}
 		}
 
 		public void Reset ()
 		{
-		    evt.Reset ();
+			ThrowIfDisposed ();
+		   evt.Reset ();
 		}
 
 		public void Set ()
 		{
-		    evt.Set ();
+			ThrowIfDisposed ();
+		   evt.Set ();
 		}
 
 		public void Wait ()
@@ -82,50 +96,70 @@ namespace System.Threading
 			return Wait (millisecondsTimeout, CancellationToken.None);
 		}
 
-		public bool Wait (TimeSpan timeout)
-		{
-			return Wait ((int)timeout.TotalMilliseconds, CancellationToken.None);
-		}
-
 		public void Wait (CancellationToken cancellationToken)
 		{
-			Wait (-1, cancellationToken);
+			Wait (Timeout.Infinite, cancellationToken);
 		}
 
-		public bool Wait (int millisecondsTimeout, CancellationToken cancellationToken)
+		public bool Wait (TimeSpan timeout)
 		{
-			if (millisecondsTimeout < -1)
-				throw new ArgumentOutOfRangeException ("millisecondsTimeout",
-				                                       "millisecondsTimeout is a negative number other than -1");
+			long totalMilliseconds = (long)timeout.TotalMilliseconds;
+         if (totalMilliseconds < -1 || totalMilliseconds > int.MaxValue) {
+				throw new ArgumentOutOfRangeException ("timeout"); 
+         }
 
-		    var alerter = cancellationToken.CanBeCanceled ? new StAlerter () : null;
-
-            using (cancellationToken.Register(StAlerter.CancellationTokenCallback, alerter)) {
-                try {
-                    return evt.Wait(new StCancelArgs (millisecondsTimeout, alerter));
-                } catch (StThreadAlertedException) {
-                    cancellationToken.ThrowIfCancellationRequested ();
-                    return false; /* Shut the compiler up */
-                }
-            }
+			return Wait ((int)totalMilliseconds, CancellationToken.None);
 		}
 
 		public bool Wait (TimeSpan timeout, CancellationToken cancellationToken)
 		{
-			return Wait ((int)timeout.TotalMilliseconds, cancellationToken);
+			long totalMilliseconds = (long)timeout.TotalMilliseconds;
+         if (totalMilliseconds < -1 || totalMilliseconds > int.MaxValue) {
+				throw new ArgumentOutOfRangeException ("timeout"); 
+         }
+
+			return Wait ((int)totalMilliseconds, cancellationToken);
 		}
 
-		#region IDisposable implementation
+		public bool Wait (int millisecondsTimeout, CancellationToken cancellationToken)
+		{
+			ThrowIfDisposed ();
 
-        public void Dispose ()
+			if (millisecondsTimeout < -1) {
+				throw new ArgumentOutOfRangeException ("millisecondsTimeout");
+			}
+
+			return evt.TryWaitOne (new StCancelArgs (millisecondsTimeout, cancellationToken));
+		}
+
+      #region IDisposable implementation
+
+      public void Dispose ()
 		{
 			Dispose (true);
+			GC.SuppressFinalize (this);
 		}
 
-		protected virtual void Dispose (bool disposing)
-		{ }
+		protected virtual void Dispose (bool disposing) 
+		{
+			if (disposing && !isDisposed) {
+				isDisposed = true;
+				if (waitHandle != null) {
+					waitHandle.Dispose ();
+					waitHandle = null;
+				}
+			}
+		}
+
+		private void ThrowIfDisposed ()
+		{
+			if (isDisposed) {
+				throw new ObjectDisposedException("ManualResetEventSlim");
+			}
+		}
 
 		#endregion
 	}
 }
+
 #endif

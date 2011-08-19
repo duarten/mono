@@ -53,6 +53,7 @@ namespace System.Threading {
 		/* Note this is an opaque object (an array), not a CultureInfo */
 		private object cached_culture_info; /*FIXME remove this on the next corlib version bump*/
 		private IntPtr free_park_spot_list;
+		internal StMutex abandoned_mutexs;
 		internal bool threadpool_thread;
 		/* accessed only from unmanaged code */
 		private IntPtr name;
@@ -1015,6 +1016,33 @@ namespace System.Threading {
 		{
 			start_obj = parameter;
 			Start ();
+		}
+
+		internal void Register (StMutex mutex)
+		{
+			if ((mutex.next = internal_thread.abandoned_mutexs) != null) {
+				internal_thread.abandoned_mutexs.prev = mutex;	
+			}
+			mutex.prev = null;
+			internal_thread.abandoned_mutexs = mutex;
+		}
+
+		internal void Release (StMutex mutex)
+		{
+			var next = mutex.next;
+			var prev = mutex.prev;
+
+			if (prev == null) {
+				internal_thread.abandoned_mutexs = mutex.next;
+			} else {
+				prev.next = next;
+			}
+
+			if (next != null) {
+				next.prev = prev;
+			}
+
+			mutex.next = mutex.prev = null;
 		}
 
 #if !MOONLIGHT

@@ -3,6 +3,7 @@
 //  
 // Author:
 //       Jérémie "Garuma" Laval <jeremie.laval@gmail.com>
+//			Duarte Nunes <duarte.m.nunes@gmail.com>
 // 
 // Copyright (c) 2009 Jérémie "Garuma" Laval
 // 
@@ -26,55 +27,104 @@
 
 #if NET_4_0 || MOBILE
 
-using System;
+#pragma warning disable 0219
+#pragma warning disable 0420
 
 namespace System.Threading
 {
 	public static class LazyInitializer
 	{
+		/*
+		 * Caches delegate instances used to create objects of type T.
+		 */
+
+      private static class FactoryCache<T>
+      {
+         internal static Func<T> Factory = () => { 
+            try { 
+               return (T)Activator.CreateInstance (typeof (T));
+            } catch (MissingMethodException) { 
+               throw new MissingMemberException (string.Format ("No parameterless ctor for the type {0}", typeof (T).Name));
+            }
+         };
+      }
+
+		/*
+       * The object reference used to generate acquire memory barriers to avoid
+		 * LD/LD reorderings on weakly ordered architectures, specifically due to
+		 * speculative loads and branch prediction.
+       */
+
+      private static volatile object barrier = typeof (LazyInitializer);
+
 		public static T EnsureInitialized<T> (ref T target) where T : class
 		{
-			return EnsureInitialized (ref target, GetDefaultCtorValue<T>);
+			if (target != null) {
+            object acquire = barrier;
+            return target;
+         }
+
+			return SlowEnsureInitialized (ref target, FactoryCache<T>.Factory);
 		}
 		
 		public static T EnsureInitialized<T> (ref T target, Func<T> valueFactory) where T : class
 		{
-			if (target == null)
-				Interlocked.CompareExchange (ref target, valueFactory (), null);
-			
-			return target;
+			if (target != null) {
+            object acquire = barrier;
+            return target;
+         }
+
+			return SlowEnsureInitialized (ref target, valueFactory);
+		}
+
+		private static T SlowEnsureInitialized<T> (ref T target, Func<T> valueFactory) where T : class
+		{
+			T v = valueFactory ();
+			if (v == null) {
+				throw new InvalidOperationException ("Factory method returned a null reference");
+			}
+
+			return Interlocked.CompareExchange (ref target, v, null) ?? v;
 		}
 
 		public static T EnsureInitialized<T> (ref T target, ref bool initialized, ref object syncLock)
 		{
-			return EnsureInitialized (ref target, ref initialized, ref syncLock, GetDefaultCtorValue<T>);
+			if (initialized) {
+            object acquire = barrier;
+            return target;
+         }
+
+			return SlowEnsureInitialized (ref target, ref initialized, ref syncLock, FactoryCache<T>.Factory);
 		}
 		
 		public static T EnsureInitialized<T> (ref T target, ref bool initialized, ref object syncLock, Func<T> valueFactory)
 		{
-			lock (syncLock) {
-				if (initialized)
+			if (initialized) {
+            object acquire = barrier;
+            return target;
+         }
+
+			return SlowEnsureInitialized (ref target, ref initialized, ref syncLock, valueFactory);
+		}
+
+		public static T SlowEnsureInitialized<T> (ref T target, ref bool initialized, ref object syncLock, Func<T> valueFactory)
+		{
+			object @lock;
+			if ((@lock = syncLock) == null) {
+				var nlock = new object();
+				@lock = Interlocked.CompareExchange (ref syncLock, nlock, null) ?? nlock;
+			}
+
+			lock (@lock) {
+				if (initialized) {
 					return target;
-				
+				}
+
 				initialized = true;
 				return target = valueFactory ();
 			}
 		}
-		
-		internal static T GetDefaultCtorValue<T> ()
-		{
-			try { 
-				return Activator.CreateInstance<T> ();
-			} catch { 
-				throw new MissingMemberException ("The type being lazily initialized does not have a "
-				                                  + "public, parameterless constructor.");
-			}
-		}
-
-		internal static T GetDefaultValueFactory<T> ()
-		{
-			return default (T);
-		}
 	}
 }
+
 #endif

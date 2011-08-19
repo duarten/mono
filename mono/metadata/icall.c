@@ -36,6 +36,7 @@
 #include <mono/metadata/threads.h>
 #include <mono/metadata/threads-types.h>
 #include <mono/metadata/parkspot.h>
+#include <mono/metadata/st-handle.h>
 #include <mono/metadata/threadpool.h>
 #include <mono/metadata/monitor.h>
 #include <mono/metadata/reflection.h>

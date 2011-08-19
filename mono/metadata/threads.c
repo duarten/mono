@@ -28,7 +28,6 @@
 #include <mono/metadata/domain-internals.h>
 #include <mono/metadata/profiler-private.h>
 #include <mono/metadata/threads.h>
-#include <mono/metadata/parkspot.h>
 #include <mono/metadata/threadpool.h>
 #include <mono/metadata/threads-types.h>
 #include <mono/metadata/exception.h>
@@ -45,12 +44,12 @@
 #include <mono/utils/mono-compiler.h>
 #include <mono/utils/mono-mmap.h>
 #include <mono/utils/mono-membar.h>
+#include <mono/utils/mono-memory-model.h>
+#include <mono/utils/mono-semaphore.h>
 #include <mono/utils/mono-time.h>
 #include <mono/utils/mono-threads.h>
 #include <mono/utils/hazard-pointer.h>
-
-#include <mono/metadata/gc-internal.h>
-
+#include <mono/utils/st.h>
 
 #ifdef PLATFORM_ANDROID
 extern int tkill (pid_t tid, int signal);
@@ -194,8 +193,10 @@ static void abort_thread_internal (MonoInternalThread *thread, gboolean can_rais
 static void suspend_thread_internal (MonoInternalThread *thread, gboolean interrupt);
 static void self_suspend_internal (MonoInternalThread *thread);
 static gboolean resume_thread_internal (MonoInternalThread *thread);
+static gboolean managed_wait_prologue (MonoInternalThread *thread);
+static void managed_wait_epilogue (MonoInternalThread *thread);
 
-static inline void cleanup_park_spot_list (ParkSpot *head);
+static void cleanup_park_spot_list (ParkSpot *head);
 
 static MonoException* mono_thread_execute_interruption (MonoInternalThread *thread);
 static void ref_stack_destroy (gpointer rs);
@@ -335,6 +336,27 @@ static void ensure_synch_cs_set (MonoInternalThread *thread)
 	}
 }
 
+static void free_abandoned_mutexs (MonoInternalThread *thread) 
+{
+	MonoObject *mutex;
+
+	mutex = thread->abandoned_mutexs;
+	while (mutex != NULL) {
+		mono_thread_push_appdomain_ref (mutex ->vtable->domain);
+
+		/*
+		 * We assume that we won't be targeted by asynchronous exceptions.
+		 */
+
+		mutex = mono_runtime_invoke (mono_class_get_method_from_name (mutex->vtable->klass, "Abandon", 0),
+											  mutex, NULL, NULL);
+
+		mono_thread_pop_appdomain_ref ();
+	}
+
+	thread->abandoned_mutexs = NULL;
+}
+
 /*
  * NOTE: this function can be called also for threads different from the current one:
  * make sure no code called from it will ever assume it is run on the thread that is
@@ -342,6 +364,7 @@ static void ensure_synch_cs_set (MonoInternalThread *thread)
  */
 static void thread_cleanup (MonoInternalThread *thread)
 {
+	
 	g_assert (thread != NULL);
 
 	if (thread->abort_state_handle) {
@@ -350,6 +373,8 @@ static void thread_cleanup (MonoInternalThread *thread)
 	}
 	thread->abort_exc = NULL;
 	thread->current_appcontext = NULL;
+
+	free_abandoned_mutexs (thread);
 
 	/*
 	 * This is necessary because otherwise we might have
@@ -1930,8 +1955,7 @@ ves_icall_System_Threading_Interlocked_Read_Long (gint64 *location)
 void
 ves_icall_System_Threading_Thread_MemoryBarrier (void)
 {
-	mono_threads_lock ();
-	mono_threads_unlock ();
+	MEMORY_BARRIER;
 }
 
 void
@@ -4605,149 +4629,239 @@ resume_thread_internal (MonoInternalThread *thread)
 }
 
 /*
- * The ParkSpot API. It is only safe to call through the Parker object.
+ * The ParkSpot API. It is only safe to call through a parker object.
  */
 
-static inline void 
+void 
 cleanup_park_spot_list (ParkSpot *head)
 {
-    while (head != NULL) {
-        ParkSpot *next = head->next;
-        mono_gc_free_fixed (head);
-        head = next;
-    }
+   while (head != NULL) {
+		ParkSpot *next = head->next;
+		g_free (head);
+		head = next;
+   }
 }
 
-gpointer 
-ves_icall_System_Threading_ParkSpot_Alloc_internal (void) 
+void 
+ves_icall_System_Threading_StInternalMethods_Alloc_internal (ParkSpot **ps) 
 {    
-    ParkSpot *ps;
-    MonoInternalThread *thread = mono_thread_internal_current ();
+   ParkSpot *park_spot;
+   MonoInternalThread *thread = mono_thread_internal_current ();
 
-    if ((ps = (ParkSpot *) thread->free_park_spot_list) != NULL) {
-        thread->free_park_spot_list = ps->next;
-    } else {
-        ps = (ParkSpot *) mono_gc_alloc_fixed (sizeof (*ps), NULL);
-        ps->thread = thread;
-				//FIXME: Initialize OS dependent blocking mechanism somewhere else.
-        MONO_SEM_INIT (&ps->handle, 0);
-    }
+   if ((park_spot = (ParkSpot *) thread->free_park_spot_list) != NULL) {
+      thread->free_park_spot_list = park_spot->next;
+   } else {
+		park_spot = (ParkSpot *) g_malloc0 (sizeof (*ps));
+		park_spot->thread = thread;
+		MONO_SEM_INIT (&park_spot->handle, 0);
+   }
 
-    ps->state = 0;
-    return ps;
+   park_spot->state = 0;
+   *ps = park_spot;
 }
 
 void 
-ves_icall_System_Threading_ParkSpot_Free_internal (ParkSpot *ps) 
+ves_icall_System_Threading_StInternalMethods_Free_internal (ParkSpot *ps) 
 {
-    MonoInternalThread *thread = ps->thread;
-    ps->next = (ParkSpot *) thread->free_park_spot_list;
-    thread->free_park_spot_list = ps;
+   MonoInternalThread *thread = ps->thread;
+	ps->state = 0;
+   ps->next = (ParkSpot *) thread->free_park_spot_list;
+   thread->free_park_spot_list = ps;
 }
 
 void 
-ves_icall_System_Threading_ParkSpot_Set_internal (ParkSpot *ps) 
+ves_icall_System_Threading_StInternalMethods_Set_internal (ParkSpot *ps) 
 {
-    /*
-     * We consider the case where a thread executing an interruption
-     * satisfies some previous wait it was in the middle of.
-     */
+  /*
+   * We consider the case where a thread executing an interruption
+   * satisfies some previous wait it was in the middle of.
+   */
 
-    if (ps->thread == mono_thread_internal_current ()) {
-        ps->state = 1;
-    } else {
-        park_spot_set_os_aware (ps);
-    }
+   if (ps->thread == mono_thread_internal_current ()) {
+		ps->state = 1;
+   } else {
+      mono_sem_post (&ps->handle);
+   }
 }
 
-static inline void 
-respond_to_interrupt_request (MonoInternalThread *thread, gboolean clr_state) 
+static gboolean
+managed_wait_prologue (MonoInternalThread *thread)
 {
-    if (thread->thread_interrupt_requested) {
-        if (clr_state) {
-            mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
-        }
+	gboolean ret;
 
-        mono_thread_interruption_checkpoint ();
+	ensure_synch_cs_set (thread);
 
-        /*
-         * Recheck because the thread may also have been suspended,
-         * which is checked first in mono_thread_execute_interruption.
-         */
+	EnterCriticalSection (thread->synch_cs);
 
-        mono_thread_current_check_pending_interrupt ();
-        g_assert_not_reached ();
-    }
+	/*
+	* We must atomically check for an interrupt request and change the
+	* thread state in order to avoid races where an interrupt request
+	* comes in just after the check but before the state change.
+	*/
+
+	if (!(ret = thread->thread_interrupt_requested)) {
+		thread->state |= ThreadState_WaitSleepJoin;	
+	}
+	
+	LeaveCriticalSection (thread->synch_cs);
+	return ret;
 }
 
-gboolean 
-wait_for_park_spot (ParkSpot *ps, int timeout, gboolean managed) 
+static void 
+managed_wait_epilogue (MonoInternalThread *thread)
 {
-    guint32 result;      
-    MonoInternalThread *thread = ps->thread;
-    int last_time = (timeout != INFINITE) ? mono_msec_ticks () : 0;
+	EnterCriticalSection (thread->synch_cs);
+	thread->state &= ~ThreadState_WaitSleepJoin;	
+	LeaveCriticalSection (thread->synch_cs);
+}
 
-    do {         
-        if (ps->state != 0) {
-            return TRUE;
-        }
+/*
+ * Waits for multiple Win32 system objects. Right now this is only used for wait any.
+ */
 
-        if (timeout == 0) {
-            return FALSE;
-        }
-        
-        respond_to_interrupt_request (thread, FALSE);
+guint32
+ves_icall_System_Threading_StInternalMethods_WaitMultiple_internal (ParkSpot *ps, MonoArray *safe_handles, 
+																						  gboolean waitAll, gint32 timeout)
+{	
+#ifdef HOST_WIN32
+	HANDLE handles [MAXIMUM_WAIT_OBJECTS];
+	guint32 i;
+	guint32 numhandles;
+	guint32 ret;	
+	MonoObject *safeHandle;
+	MonoInternalThread *thread = mono_thread_internal_current ();	
 
-        if (managed) {
-            mono_thread_set_state (thread, ThreadState_WaitSleepJoin);
-        }
+	numhandles = mono_array_length (safe_handles);
+	if (numhandles > MAXIMUM_WAIT_OBJECTS) {
+		return WAIT_FAILED;
+	}
 
-        /*
-         * Recheck since an interrupt request may have come in just 
-         * before setting the state to WaitSleepJoin.
-         */
+	for (i = 0; i < numhandles; ++i) {	
+		safeHandle = mono_array_get (safe_handles, MonoObject*, i);
+		handles [i] = ((MonoSafeHandle *)safeHandle)->handle;
+	}
+	
+	if (ps != NULL) {
+		g_assert (thread == ps->thread);
+		handles [i] = (HANDLE) ps->handle;
+		numhandles += 1;
+	}
 
-        respond_to_interrupt_request (thread, managed);
+	if (!managed_wait_prologue (thread)) {
+		return FALSE;
+	}
 
-        if (thread->thread_interrupt_requested) {
-            if (managed) {
-                mono_thread_set_state (thread, ThreadState_WaitSleepJoin);
-            }
-            mono_thread_interruption_checkpoint ();
+	ret = WaitForMultipleObjectsEx (numhandles, handles, waitAll, timeout, TRUE);
 
-        }
+	managed_wait_epilogue (thread);
 
-        /*
-         * Perfom the wait using some OS aware mechanism.
-         */
+	THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") returning %d", __func__, GetCurrentThreadId (), ret));
 
-        result = park_spot_wait_os_aware (ps, timeout);
+	if (ret >= WAIT_OBJECT_0 && ret <= WAIT_OBJECT_0 + numhandles - 1) {
+		return ret - WAIT_OBJECT_0;
+	}
+	
+	if (ret >= WAIT_ABANDONED_0 && ret <= WAIT_ABANDONED_0 + numhandles - 1) {
+		return ret - WAIT_ABANDONED_0;
+	}
+#endif
+	return FALSE;
+}
 
-        if (managed) {
-            mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
-        }
+/*
+ * Waits for a Win32 system object.
+ */
 
-        if (errno != EINTR) {
-            return result == 0;
-        }
+gboolean
+ves_icall_System_Threading_StInternalMethods_Wait_internal (HANDLE handle, gint32 timeout)
+{
+#ifdef HOST_WIN32
+	guint32 ret;
+	MonoInternalThread *thread = mono_thread_internal_current ();
 
-        mono_thread_interruption_checkpoint ();
+	THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") waiting for %p, %d ms", __func__, GetCurrentThreadId (), handle, timeout));
+	
+	if (!managed_wait_prologue (thread)) {
+		return FALSE;
+	}
+	
+	ret = WaitForSingleObjectEx (handle, timeout, TRUE);
+	
+	managed_wait_epilogue (thread);
+	
+	if (ret == WAIT_FAILED) {
+		THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Wait failed", __func__, GetCurrentThreadId ()));
+		return FALSE;
+	} else if (ret == WAIT_TIMEOUT || ret == WAIT_IO_COMPLETION) {
+		THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Wait timed out", __func__, GetCurrentThreadId ()));
+		return FALSE;
+	}
+#endif
+	return TRUE;
+}
 
-        if (ps->state == 0 && timeout != INFINITE) {
-            int now = mono_msec_ticks ();
-            int elapsed = (now == last_time) ? 1 : now - last_time;
-            if (elapsed < timeout) {
-                timeout -= elapsed;
-            } else {
-                timeout = 0;
+/*
+ * All waits from managed code are interruptible and cause state changes.
+ */
+
+guint32 
+wait_for_park_spot (ParkSpot *ps, guint32 timeout, gboolean interruptible, gboolean managed) 
+{
+	guint32 last_time;
+   guint32 res;     
+   MonoInternalThread *thread = ps->thread;
+
+	THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") waiting for %p, %d ms", __func__, GetCurrentThreadId (), ps, ms));
+
+	last_time = timeout != INFINITE ? mono_msec_ticks () : 0;
+
+   do {         
+      if (ps->state != 0) {
+         return TRUE;
+      }
+
+      if (timeout == 0) {
+			THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Wait timed out", __func__, GetCurrentThreadId ()));
+         return FALSE;
+      }
+
+		if (managed && !managed_wait_prologue (thread)) {
+			return -1;
+		}
+
+		res = mono_sem_timedwait (&ps->handle, timeout, TRUE);
+
+		if (managed) {
+			managed_wait_epilogue (thread);
+		}
+
+      if (errno != EINTR) {
+         return res == 0;
+      } else if (managed || interruptible || shutting_down) {
+				THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Wait failed", __func__, GetCurrentThreadId ()));			
+				return -1;
+		}
+
+      if (ps->state == 0 && timeout != INFINITE) {
+         int now = mono_msec_ticks ();
+         int elapsed = now == last_time ? 1 : now - last_time;
+         if (timeout <= elapsed) {
+            timeout = 0;
+         } else {
+            timeout -= elapsed;
 			}
-            last_time = now;
-        }
-    } while (TRUE);
+
+			last_time = now;
+      }
+   } while (TRUE);
 }
 
-gboolean 
-ves_icall_System_Threading_ParkSpot_Wait_internal (ParkSpot *ps, int timeout)
+gboolean
+ves_icall_System_Threading_StInternalMethods_WaitForParkSpot_internal (ParkSpot *ps, gint32 timeout)
 {
-    return wait_for_park_spot (ps, timeout, TRUE);
+	guint32 res;
+   if ((res = wait_for_park_spot (ps, timeout, TRUE, TRUE)) == -1) {
+		mono_thread_interruption_checkpoint ();
+	}
+	return res == 0;
 }

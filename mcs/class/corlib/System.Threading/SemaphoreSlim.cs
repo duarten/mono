@@ -1,6 +1,7 @@
 // SemaphoreSlim.cs
 //
 // Copyright (c) 2008 Jérémie "Garuma" Laval
+// Copyright (c) 2011 Duarte Nunes
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -22,97 +23,75 @@
 //
 //
 
-using System;
-using System.Diagnostics;
-
 #if NET_4_0 || MOBILE
+
 namespace System.Threading
 {
-	[System.Diagnostics.DebuggerDisplayAttribute ("Current Count = {currCount}")]
+	[Diagnostics.DebuggerDisplayAttribute ("Current Count = {currCount}")]
 	public class SemaphoreSlim : IDisposable
 	{
-		const int spinCount = 10;
-		const int deepSleepTime = 20;
+		private const int defaultSpinCount = 256;
+	   private readonly StSemaphore sem;
+		private volatile ManualResetEvent waitHandle;
+		private bool isDisposed;
 
-		readonly int maxCount;
-		int currCount;
-		bool isDisposed;
-
-		EventWaitHandle handle;
-
-		public SemaphoreSlim (int initialCount) : this (initialCount, int.MaxValue)
-		{
-		}
+		public SemaphoreSlim (int initialCount) 
+         : this (initialCount, int.MaxValue) { }
 
 		public SemaphoreSlim (int initialCount, int maxCount)
 		{
-			if (initialCount < 0 || initialCount > maxCount || maxCount < 0)
-				throw new ArgumentOutOfRangeException ("The initialCount  argument is negative, initialCount is greater than maxCount, or maxCount is not positive.");
+			if (initialCount < 0 || initialCount > maxCount || maxCount < 0) {
+			    throw new ArgumentOutOfRangeException ("initialCount");
+			}
 
-			this.maxCount = maxCount;
-			this.currCount = initialCount;
-			this.handle = new ManualResetEvent (initialCount == 0);
-		}
+		   if (maxCount < 0) {
+             throw new ArgumentOutOfRangeException ("maxCount");
+         }
 
-		~SemaphoreSlim ()
-		{
-			Dispose(false);
-		}
-
-		public void Dispose ()
-		{
-			Dispose(true);
-		}
-
-		protected virtual void Dispose (bool disposing)
-		{
-			isDisposed = true;
-		}
-
-		void CheckState ()
-		{
-			if (isDisposed)
-				throw new ObjectDisposedException ("The SemaphoreSlim has been disposed.");
+		   sem = new StSemaphore (initialCount, maxCount, defaultSpinCount);
 		}
 
 		public int CurrentCount {
-			get {
-				return currCount;
-			}
+			get { return sem.CurrentCount; }
 		}
 
-		public int Release ()
-		{
-			return Release(1);
+      public WaitHandle AvailableWaitHandle {
+			get {
+				ThowIfDisposed ();
+				ManualResetEvent mre;
+				if ((mre = waitHandle) == null) {
+					mre = new ManualResetEvent (false);
+					ManualResetEvent nmre;
+					if ((nmre = Interlocked.CompareExchange (ref waitHandle, mre, null)) == null) {
+						if (CurrentCount > 0) {
+							mre.Set();
+						}
+					} else {
+						mre = nmre;
+					}
+				}
+				return mre;
+			}
 		}
 
 		public int Release (int releaseCount)
 		{
-			CheckState ();
-			if (releaseCount < 1)
-				throw new ArgumentOutOfRangeException ("releaseCount", "releaseCount is less than 1");
+			ThowIfDisposed ();
+			int oldCount = sem.Release (releaseCount);
+			if (oldCount == 0 && waitHandle != null) {
+				waitHandle.Set ();
+			}
+			return oldCount;
+		}
 
-			// As we have to take care of the max limit we resort to CAS
-			int oldValue, newValue;
-			do {
-				oldValue = currCount;
-				newValue = (currCount + releaseCount);
-				newValue = newValue > maxCount ? maxCount : newValue;
-			} while (Interlocked.CompareExchange (ref currCount, newValue, oldValue) != oldValue);
-
-			handle.Set ();
-
-			return oldValue;
+		public int Release ()
+		{
+			return Release (1);
 		}
 
 		public void Wait ()
 		{
 			Wait (CancellationToken.None);
-		}
-
-		public bool Wait (TimeSpan timeout)
-		{
-			return Wait ((int)timeout.TotalMilliseconds, CancellationToken.None);
 		}
 
 		public bool Wait (int millisecondsTimeout)
@@ -122,72 +101,85 @@ namespace System.Threading
 
 		public void Wait (CancellationToken cancellationToken)
 		{
-			Wait (-1, cancellationToken);
+			Wait (Timeout.Infinite, cancellationToken);
+		}
+
+		public bool Wait (TimeSpan timeout)
+		{
+			long totalMilliseconds = (long)timeout.TotalMilliseconds;
+         if (totalMilliseconds < -1 || totalMilliseconds > int.MaxValue) {
+				throw new ArgumentOutOfRangeException ("timeout"); 
+         }
+
+			return Wait ((int)totalMilliseconds, CancellationToken.None);
 		}
 
 		public bool Wait (TimeSpan timeout, CancellationToken cancellationToken)
 		{
-			CheckState();
-			return Wait ((int)timeout.TotalMilliseconds, cancellationToken);
+			long totalMilliseconds = (long)timeout.TotalMilliseconds;
+         if (totalMilliseconds < -1 || totalMilliseconds > int.MaxValue) {
+				throw new ArgumentOutOfRangeException ("timeout"); 
+         }
+
+			return Wait ((int)totalMilliseconds, cancellationToken);
 		}
 
 		public bool Wait (int millisecondsTimeout, CancellationToken cancellationToken)
 		{
-			CheckState ();
-			if (millisecondsTimeout < -1)
-				throw new ArgumentOutOfRangeException ("millisecondsTimeout",
-				                                       "millisecondsTimeout is a negative number other than -1");
+			ThowIfDisposed ();
 
-			Watch sw = Watch.StartNew ();
+			if (millisecondsTimeout < -1) {
+				throw new ArgumentOutOfRangeException ("millisecondsTimeout");
+			}
 
-			Func<bool> stopCondition = () => millisecondsTimeout >= 0 && sw.ElapsedMilliseconds > millisecondsTimeout;
+			bool success = sem.TryWait (1, new StCancelArgs (millisecondsTimeout, cancellationToken));
+			if (success) {
+				
+				/*
+				 * It's OK if the event is set but there are no permits, because there is
+				 * an implied race between waiting on the wait handle and waiting on the 
+				 * semaphore. However, it's not OK if there are permits but the event is
+				 * not set. The second test of CurrentCount ensures that won't happen.
+				 */
 
-			do {
-				bool shouldWait;
-				int result;
-
-				do {
-					cancellationToken.ThrowIfCancellationRequested ();
-					if (stopCondition ())
-						return false;
-
-					shouldWait = true;
-					result = currCount;
-
-					if (result > 0)
-						shouldWait = false;
-					else
-						break;
-				} while (Interlocked.CompareExchange (ref currCount, result - 1, result) != result);
-
-				if (!shouldWait) {
-					if (result == 1)
-						handle.Reset ();
-					break;
+				if (sem.CurrentCount == 0 && waitHandle != null) {
+					waitHandle.Reset ();
+					if (sem.CurrentCount > 0) {
+						waitHandle.Set ();
+					}
 				}
-
-				SpinWait wait = new SpinWait ();
-
-				while (Thread.VolatileRead (ref currCount) <= 0) {
-					cancellationToken.ThrowIfCancellationRequested ();
-					if (stopCondition ())
-						return false;
-
-					if (wait.Count > spinCount)
-						handle.WaitOne (Math.Min (Math.Max (millisecondsTimeout - (int)sw.ElapsedMilliseconds, 1), deepSleepTime));
-					else
-						wait.SpinOnce ();
-				}
-			} while (true);
-
-			return true;
+			}
+			return success;
 		}
 
-		public WaitHandle AvailableWaitHandle {
-			get {
-				return handle;
+      #region IDisposable implementation
+
+      public void Dispose ()
+		{
+			Dispose (true);
+			GC.SuppressFinalize (this);
+		}
+
+		protected virtual void Dispose (bool disposing) 
+		{
+			if (disposing && !isDisposed) {
+				isDisposed = true;
+				if (waitHandle != null) {
+					waitHandle.Dispose ();
+					waitHandle = null;
+				}
 			}
 		}
+
+		private void ThowIfDisposed ()
+		{
+			if (isDisposed) {
+				throw new ObjectDisposedException("SemaphoreSlim");
+			}
+		}
+
+		#endregion
 	}
 }
+
 #endif

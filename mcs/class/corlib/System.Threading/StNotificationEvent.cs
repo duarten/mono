@@ -18,357 +18,240 @@
 // Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 // 
 
+using System.Runtime.CompilerServices;
+
 #pragma warning disable 0420
 
 namespace System.Threading
 {
-    internal struct NotificationEvent
-    {
-        //
-        // The value of the *state* field when the event is signalled.
-        //
+	internal abstract class StNotificationEventBase : StWaitable
+   {
+      internal static readonly StWaitBlock SET = StWaitBlock.SENTINEL;
 
-        internal static readonly StWaitBlock SET = StWaitBlock.SENTINEL;
+      /*
+       * The state of the event and the event's queue (i.e., a non-blocking
+       * stack) are stored on the *state* field as follows:
+       * - *state* == SET: the event is signalled;
+       * - *state* == null: the event is non-signalled the queue is empty;
+       * - *state* != null && *state* != SET: the event is non-signalled
+		 *                                      and its queue is non-empty;
+		 * - *state* == INFLATED: the object is inflated.                                     
+		 */
 
-        //
-        // The state of the event and the event's queue (i.e., a non-blocking
-        // stack) are stored on the *state* field as follows:
-        // - *state* == SET: the event is signalled;
-        // - *state* == null: the event is non-signalled the queue is empty;
-        // - *state* != null && *state* != SET: the event is non-signalled
-        //                                      and its queue is non-empty.
-        //
+      internal volatile StWaitBlock state;
+      internal readonly int spinCount;
 
-        internal volatile StWaitBlock state;
+      internal StNotificationEventBase (bool initialState, int sc)
+      {
+			id = NOTIFICATION_EVENT_ID;
+         state = initialState ? SET : null;
+         spinCount = Environment.ProcessorCount > 0 ? sc : 0;
+      }
 
-        //
-        // The number of spin cycles executed by the first waiter
-        // thread before it blocks on the park spot.
-        //
+      internal StNotificationEventBase (bool initialState)
+         : this (initialState, 0) { }
 
-        internal readonly int spinCount;
+      internal override bool _AllowsAcquire {
+         get { return state == SET; }
+      }
 
-        internal NotificationEvent (bool initialState, int sc)
-        {
-            state = initialState ? SET : null;
-            spinCount = Environment.ProcessorCount > 0 ? sc : 0;
-        }
+		internal bool Set ()
+      {
+			bool done;
+			StWaitBlock p;
+			do {
+				if ((p = state) == SET) {
+					return true;
+				}
 
-        internal NotificationEvent (bool initialState)
-            : this (initialState, 0) { }
+				if (p == INFLATED) {
+					bool release = false;
+					try {
+						swhandle.DangerousAddRef (ref release);
+						return StInternalMethods.SetEvent (swhandle.DangerousGetHandle ());
+					} finally {
+						if (release) {
+							swhandle.DangerousRelease ();
+						}
+					}
+				}
 
-        //
-        // Returns true if the event is set.
-        //
+				RuntimeHelpers.PrepareConstrainedRegions ();
+				try { }
+				finally {
+					if ((done = Interlocked.CompareExchange(ref state, SET, p) == p) &&
+						 p != null && p != SET) {
+						
+						/*
+						 * If spinning is configured and there is more than one thread in the
+						 * wait queue, we first release the thread that is spinning. As only 
+						 * one thread spins, we maximize the chances of unparking that thread
+						 * before it blocks.
+						 */
 
-        internal bool IsSet {
-            get { return state == SET; }
-        }
+						StParker pk;
+						if (spinCount != 0 && p.next != null) {
+							StWaitBlock pv = p, n;
+							while ((n = pv.next) != null && n.next != null) {
+								pv = n;
+							}
 
-        //
-        // Sets the event to the signalled state.
-        //
+							if (n != null) {
+								pv.next = null;
+								if ((pk = n.parker).TryLock ()) {
+									pk.Unpark (n.waitKey);
+								}
+							}
+						}
+         
+						do {
+							if ((pk = p.parker).TryLock ()) {
+								pk.Unpark (p.waitKey);
+							}
+						} while ((p = p.next) != null);
+					}
+						
+				}
+			} while (!done);
 
-        internal bool Set ()
-        {
-            //
-            // If the event is already signalled, return true.
-            //
+			return true;
+      }
 
-            if (state == SET) {
-                return true;
-            }
+		internal bool Reset ()
+      {
+			StWaitBlock s;
+			if ((s = state) == SET && (s = Interlocked.CompareExchange(ref state, null, SET)) == SET) {
+				return true;
+			}
 
-            //
-            // Atomically signal the event and grab the wait queue.
-            //
+			if (s == INFLATED) {
+				bool release = false;
+				try {
+					swhandle.DangerousAddRef (ref release);
+					return StInternalMethods.ResetEvent (swhandle.DangerousGetHandle ());
+				} finally {
+					if (release) {
+						swhandle.DangerousRelease ();
+					}
+				}
+			}
 
-            StWaitBlock p = Interlocked.Exchange (ref state, SET);
+			return true;
+      }
 
-            //
-            // If the event queue is empty, return the previous state of the event.
-            //
+      internal override bool _TryAcquire ()
+      {
+         return _AllowsAcquire;
+      }
 
-            if (p == null || p == SET) {
-                return p == SET;
-            }
+      internal override StWaitBlock _WaitAnyPrologue (StParker pk, int key,
+                                                      ref StWaitBlock hint, ref int sc)
+      {
+         return WaitWithParker (pk, WaitType.WaitAny, key, ref hint, ref sc);
+      }
 
-            //
-            // If spinning is configured and there is more than one thread in the
-            // wait queue, we first release the thread that is spinning. As only 
-            // one thread spins, we maximize the chances of unparking that thread
-            // before it blocks.
-            //
+      internal override StWaitBlock _WaitAllPrologue (StParker pk, ref StWaitBlock hint,
+                                                      ref int sc)
+      {
+         return WaitWithParker (pk, WaitType.WaitAll, StParkStatus.StateChange, ref hint, ref sc);
+      }
 
-            StParker pk;
-            if (spinCount != 0 && p.next != null) {
-                StWaitBlock pv = p, n;
-                while ((n = pv.next) != null && n.next != null) {
-                    pv = n;
-                }
-
-                if (n != null) {
-                    pv.next = null;
-                    if ((pk = n.parker).TryLock ()) {
-                        pk.Unpark (n.waitKey);
-                    }
-                }
-            }
-
-            //
-            // Lock and unpark all waiting threads.
-            //
-
-            do {
-                if ((pk = p.parker).TryLock ()) {
-                    pk.Unpark (p.waitKey);
-                }
-            }
-            while ((p = p.next) != null);
-
-            //
-            // Return the previous state of the event.
-            //
-
-            return false;
-        }
-
-        //
-        // Resets the event to the non-signalled state.
-        //
-
-        internal bool Reset ()
-        {
-            return state == SET && Interlocked.CompareExchange (ref state, null, SET) == SET;
-        }
-
-        //
-        // Waits until the event is signalled, activating the specified cancellers.
-        //
-
-        internal int Wait (StCancelArgs cargs)
-        {
-            return state == SET
-                       ? StParkStatus.Success
-                       : cargs.Timeout == 0
-                             ? StParkStatus.Timeout
-                             : SlowWait (cargs, new StWaitBlock (WaitType.WaitAny));
-        }
-
-        private int SlowWait (StCancelArgs cargs, StWaitBlock wb)
-        {
-            do {
-                //
-                // If the event is now signalled, return success.
-                //
-
-                StWaitBlock s;
-                if ((s = state) == SET) {
-                    return StParkStatus.Success;
-                }
-
-                wb.next = s;
-                if (Interlocked.CompareExchange (ref state, wb, s) == s) {
-                    break;
-                }
-            }
-            while (true);
-
-            //
-            // Park the current thread, activating the specified cancellers and spinning
-            // if appropriate.
-            //
-
-            int ws = wb.parker.Park (wb.next == null ? spinCount : 0, cargs);
-
-            //
-            // If the wait was cancelled, unlink the wait block from the
-            // event's queue.
-            //
-
-            if (ws != StParkStatus.Success) {
-                Unlink (wb);
-            }
-
-            return ws;
-        }
-
-        //
-        // Waits until the event is signalled, using the specified parker object.
-        //
-
-        internal StWaitBlock WaitWithParker (StParker pk, WaitType type, int key, ref int sc)
-        {
-            StWaitBlock wb = null;
-            do {
-                StWaitBlock s;
-                if ((s = state) == SET) {
-                    //
-                    // The event is signalled. Try to lock it and self unpark the current thread. 
-                    // Anyway, return null to signal that no wait block was queued.
-                    //
-
-                    if (pk.TryLock ()) {
-                        pk.UnparkSelf (key);
-                    }
-                    return null;
-                }
-
-                //
-                // The event seems closed; so, if this is the first loop iteration,
-                // create a wait block.
-                //
-
-                if (wb == null) {
-                    wb = new StWaitBlock (pk, type, 0, key);
-                }
-
-                //
-                // Try to insert the wait block in the event's queue, if the
-                // event remains non-signalled.
-                //
-
-                wb.next = s;
-                if (Interlocked.CompareExchange (ref state, wb, s) == s) {
-                    //
-                    // Return the inserted wait block and the suggested spin count.
-                    //
-
-                    sc = s == null ? spinCount : 0;
-                    return wb;
-                }
-            }
-            while (true);
-        }
-
-        //
-        // Unlinks the wait block from the event's wait queue.
-        //
-
-        internal void Unlink (StWaitBlock wb)
-        {
+		private StWaitBlock WaitWithParker (StParker pk, WaitType type, int key, 
+														ref StWaitBlock hint, ref int sc)
+      {
+         StWaitBlock wb = null;
+         do {
             StWaitBlock s;
-            if ((s = state) == SET || s == null ||
-                (wb.next == null && s == wb &&
-                 Interlocked.CompareExchange (ref state, null, s) == s)) {
-                return;
-            }
-            SlowUnlink (wb);
-        }
-
-        //
-        // Slow path to unlink the wait block from the event's
-        // wait queue.
-        //
-
-        internal void SlowUnlink (StWaitBlock wb)
-        {
-            StWaitBlock next;
-            if ((next = wb.next) != null && next.parker.IsLocked) {
-                next = next.next;
+            if ((s = state) == SET) {
+               return null;
             }
 
-            StWaitBlock p = state;
+				if (s == INFLATED) {
+					hint = INFLATED;
+					return null;
+				}
 
-            while (p != null && p != next && state != null && state != SET) {
-                StWaitBlock n;
-                if ((n = p.next) != null && n.parker.IsLocked) {
-                    p.CasNext (n, n.next);
-                }
-                else {
-                    p = n;
-                }
-            }
-        }
-    }
-
-    internal abstract class StNotificationEventBase : StWaitable
-    {
-        internal NotificationEvent waitEvent;
-
-        protected StNotificationEventBase (bool initialState, int sc)
-        {
-            id = NOTIFICATION_EVENT_ID;
-            waitEvent = new NotificationEvent (initialState, sc);
-        }
-
-        protected StNotificationEventBase (bool initialState)
-            : this (initialState, 0) { }
-
-        internal override bool _AllowsAcquire
-        {
-            get { return waitEvent.IsSet; }
-        }
-
-        internal override bool _TryAcquire ()
-        {
-            return waitEvent.IsSet;
-        }
-
-        internal override StWaitBlock _WaitAnyPrologue (StParker pk, int key,
-                                                        ref StWaitBlock hint, ref int sc)
-        {
-            return waitEvent.WaitWithParker (pk, WaitType.WaitAny, key, ref sc);
-        }
-
-        internal override StWaitBlock _WaitAllPrologue (StParker pk, ref StWaitBlock hint,
-                                                        ref int sc)
-        {
-            return waitEvent.WaitWithParker (pk, WaitType.WaitAll, StParkStatus.StateChange, ref sc);
-        }
-
-
-        internal override void _CancelAcquire (StWaitBlock wb, StWaitBlock ignored)
-        {
-            waitEvent.Unlink (wb);
-        }
-    }
-
-    internal sealed class StNotificationEvent : StNotificationEventBase
-    {
-        internal StNotificationEvent (bool initialState, int spinCount)
-            : base (initialState, spinCount) { }
-
-        internal StNotificationEvent (bool initialState)
-            : this (initialState, 0) { }
-
-        internal StNotificationEvent ()
-            : this (false, 0) { }
-
-        public bool IsSet {
-            get { return waitEvent.IsSet; }
-        }
-
-        public bool Set ()
-        {
-            return waitEvent.Set ();
-        }
-
-        public bool Reset ()
-        {
-            return waitEvent.Reset ();
-        }
-
-        public bool Wait (StCancelArgs cargs)
-        {
-            int ws = waitEvent.Wait (cargs);
-            if (ws == StParkStatus.Success) {
-                return true;
+            if (wb == null) {
+               wb = new StWaitBlock (pk, type, 0, key);
             }
 
-            StCancelArgs.ThrowIfException (ws);
-            return false;
-        }
+            wb.next = s;
+            if (Interlocked.CompareExchange (ref state, wb, s) == s) {
+               sc = s == null ? spinCount : 0;
+               return wb;
+            }
+         } while (true);
+      }
 
-        public void Wait ()
-        {
-            Wait (StCancelArgs.None);
-        }
+		internal override StWaitBlock _Inflate()
+		{
+			StWaitBlock s = Interlocked.Exchange (ref state, INFLATED);
+			if (s == SET) {
+				StInternalMethods. SetEvent (swhandle.DangerousGetHandle ());
+				return null;
+			}
+			return s;
+		}
 
-        internal override bool _Release ()
-        {
-            waitEvent.Set ();
-            return true;
-        }
-    }
+		internal override IntPtr _CreateNativeObject()
+		{
+			return StInternalMethods. CreateEvent (IntPtr.Zero, true, false, null);
+		}
+
+      internal override void _CancelAcquire (StWaitBlock wb, StWaitBlock ignored)
+      {
+         Unlink (wb);
+      }
+
+		internal void Unlink (StWaitBlock wb)
+      {
+         StWaitBlock s;
+         if ((s = state) == SET || s == null || s == INFLATED ||
+				 (wb.next == null && s == wb && Interlocked.CompareExchange (ref state, null, s) == s)) {
+				return;
+         }
+         SlowUnlink (wb);
+      }
+
+      private void SlowUnlink (StWaitBlock wb)
+      {
+         StWaitBlock next;
+         if ((next = wb.next) != null && next.parker.IsLocked) {
+            next = next.next;
+         }
+
+         StWaitBlock p = state;
+			StWaitBlock s;
+
+         while (p != null && p != next && (s = state) != null && s != SET && s != INFLATED) {
+            StWaitBlock n;
+            if ((n = p.next) != null && n.parker.IsLocked) {
+               p.CasNext (n, n.next);
+            } else {
+               p = n;
+            }
+         }
+      }
+   }
+
+   internal sealed class StNotificationEvent : StNotificationEventBase
+   {
+      internal StNotificationEvent (bool initialState, int spinCount)
+         : base (initialState, spinCount) { }
+
+      internal StNotificationEvent (bool initialState)
+         : this (initialState, 0) { }
+
+      internal StNotificationEvent ()
+         : this (false, 0) { }
+
+      internal bool IsSet {
+         get { return _AllowsAcquire; }
+      }
+
+      internal override bool _Release ()
+      {
+         return Set ();
+      }
+   }
 }

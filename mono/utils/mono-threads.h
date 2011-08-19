@@ -64,7 +64,7 @@ enum {
 
 typedef struct {
 	MonoLinkedListSetNode node;
-	guint32 small_id; /*Used by hazard pointers */
+	guint32 small_id; /*Used by hazard pointers and the monitor machinery */
 	MonoNativeThreadHandle native_handle;
 	int thread_state;
 

@@ -108,8 +108,17 @@ namespace System.Threading {
 										int millisecondsTimeOutInterval,
 										bool executeOnlyOnce)
 		{
-			return RegisterWaitForSingleObject (waitObject, callBack, state,
-							    (long) millisecondsTimeOutInterval, executeOnlyOnce);
+			if (callBack == null) {
+				throw new ArgumentNullException ("callBack");
+			}
+
+			if (millisecondsTimeOutInterval < -1) {
+				throw new ArgumentOutOfRangeException ("millisecondsTimeOutInterval", "timeout < -1");
+			}
+			
+			return new RegisteredWaitHandle (waitObject, callBack, state, 
+														millisecondsTimeOutInterval, 
+														executeOnlyOnce);
 		}
 
 		public static RegisteredWaitHandle RegisterWaitForSingleObject (WaitHandle waitObject,
@@ -118,18 +127,13 @@ namespace System.Threading {
 										long millisecondsTimeOutInterval,
 										bool executeOnlyOnce)
 		{
-			if (millisecondsTimeOutInterval < -1)
-				throw new ArgumentOutOfRangeException ("timeout", "timeout < -1");
+			if (millisecondsTimeOutInterval > Int32.MaxValue) {
+				throw new ArgumentOutOfRangeException ("millisecondsTimeOutInterval", "Timeout is too big. Maximum is Int32.MaxValue");
+			}
 
-			if (millisecondsTimeOutInterval > Int32.MaxValue)
-				throw new NotSupportedException ("Timeout is too big. Maximum is Int32.MaxValue");
-
-			TimeSpan timeout = new TimeSpan (0, 0, 0, 0, (int) millisecondsTimeOutInterval);
-			
-			RegisteredWaitHandle waiter = new RegisteredWaitHandle (waitObject, callBack, state,
-										timeout, executeOnlyOnce);
-			QueueUserWorkItem (new WaitCallback (waiter.Wait), null);
-			return waiter;
+			return RegisterWaitForSingleObject (waitObject, callBack, state,
+														   (int)millisecondsTimeOutInterval,
+														   executeOnlyOnce);
 		}
 
 		public static RegisteredWaitHandle RegisterWaitForSingleObject (WaitHandle waitObject,
@@ -139,7 +143,8 @@ namespace System.Threading {
 										bool executeOnlyOnce)
 		{
 			return RegisterWaitForSingleObject (waitObject, callBack, state,
-							    (long) timeout.TotalMilliseconds, executeOnlyOnce);
+															(long)timeout.TotalMilliseconds, 
+															executeOnlyOnce);
 
 		}
 
@@ -151,7 +156,8 @@ namespace System.Threading {
 										bool executeOnlyOnce)
 		{
 			return RegisterWaitForSingleObject (waitObject, callBack, state,
-							    (long) millisecondsTimeOutInterval, executeOnlyOnce);
+															(int)millisecondsTimeOutInterval, 
+															executeOnlyOnce);
 		}
 
 		[CLSCompliant (false)]

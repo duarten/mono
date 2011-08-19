@@ -1,21 +1,32 @@
 //
 // System.Threading.Mutex.cs
 //
-// Copyright 2011 Duarte Nunes
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-// http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Author:
+//   Dick Porter (dick@ximian.com)
+//   Veronica De Santis (veron78@interfree.it)
+//	  Duarte Nunes (duarte.m.nunes@gmail.com)
 //
-// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
+// (C) Ximian, Inc.  http://www.ximian.com
+// Copyright (C) 2004-2005 Novell, Inc (http://www.novell.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 
 using System.Runtime.ConstrainedExecution;
@@ -30,28 +41,31 @@ namespace System.Threading
 	[ComVisible (true)]
 	public sealed class Mutex : WaitHandle 
 	{
+		private const int defaultSpinCount = 256;
+
 		[ReliabilityContractAttribute (Consistency.WillNotCorruptState, Cer.MayFail)]
 		public Mutex ()
-            : this(false) { }
+            : this (false) { }
 		
 		[ReliabilityContractAttribute (Consistency.WillNotCorruptState, Cer.MayFail)]
-		public Mutex (bool initiallyOwned) 
-        {
-            Waitable = new StReentrantFairLock(initiallyOwned);
-		}
+		public Mutex (bool initiallyOwned)
+			: base (Environment.OSVersion.Platform == PlatformID.Win32NT 
+			        ? (StWaitable) new StInflatedMutex (initiallyOwned) 
+			        : new StMutex (initiallyOwned, defaultSpinCount))
+      { }
 
 		[ReliabilityContractAttribute (Consistency.WillNotCorruptState, Cer.MayFail)]
 		[SecurityPermission (SecurityAction.LinkDemand, UnmanagedCode = true)]
 		public Mutex (bool initiallyOwned, string name)
 		{
-            throw new NotImplementedException ();
+         throw new NotImplementedException ();
 		}
 
 		[ReliabilityContractAttribute (Consistency.WillNotCorruptState, Cer.MayFail)]
 		[SecurityPermission (SecurityAction.LinkDemand, UnmanagedCode = true)]
 		public Mutex (bool initiallyOwned, string name, out bool createdNew)
 		{
-            throw new NotImplementedException ();
+			throw new NotImplementedException ();
 		}
 
 #if !NET_2_1
@@ -59,7 +73,7 @@ namespace System.Threading
 		[ReliabilityContractAttribute (Consistency.WillNotCorruptState, Cer.MayFail)]
 		public Mutex (bool initiallyOwned, string name, out bool createdNew, MutexSecurity mutexSecurity)
 		{
-            throw new NotImplementedException ();
+			throw new NotImplementedException ();
 		}
 
 		public MutexSecurity GetAccessControl ()
@@ -74,29 +88,31 @@ namespace System.Threading
 		
 		public static Mutex OpenExisting (string name, MutexRights rights)
 		{
-            throw new NotImplementedException ();
+         throw new NotImplementedException ();
 		}
 #endif
 
-        internal override bool _WaitOne (int timeout)
-        {
-            var flock = Waitable as StReentrantFairLock;
-            return flock != null ? flock.Enter(new StCancelArgs (timeout)) : false;
-        }
-
 		[ReliabilityContractAttribute (Consistency.WillNotCorruptState, Cer.MayFail)]
 		public void ReleaseMutex ()
-        {
-            var flock = Waitable as StReentrantFairLock;
-            if (flock == null) {
-                return;
-            }
+		{
+			if (Environment.OSVersion.Platform == PlatformID.Win32NT) {
+				var mutex = waitable as StInflatedMutex;
+				if (mutex != null) {
+					mutex.Exit ();
+				}
+			} else {
+				var mutex = waitable as StMutex;
+				if (mutex != null) {
+					mutex.Exit ();
+				}		
+			}
+		}
 
-            try { 
-                flock.Exit();
-            } catch (InvalidOperationException) {
-                throw new ApplicationException("Mutex is not owned");
-            }
+		internal override StWaitable CreateWaitable ()
+		{
+			return Environment.OSVersion.Platform == PlatformID.Win32NT 
+			    ? (StWaitable) new StInflatedMutex (false) 
+			    : new StMutex (defaultSpinCount);
 		}
 
 #if !NET_2_1

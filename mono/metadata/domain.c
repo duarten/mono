@@ -1559,6 +1559,12 @@ mono_init_internal (const char *filename, const char *exe_filename, const char *
 
 	mono_defaults.critical_finalizer_object = mono_class_from_name (
 		mono_defaults.corlib, "System.Runtime.ConstrainedExecution", "CriticalFinalizerObject");
+		
+	mono_defaults.st_waitable_class = mono_class_from_name (
+		mono_defaults.corlib, "System.Threading", "StWaitable");
+
+	mono_defaults.st_waitblock_class = mono_class_from_name (
+		mono_defaults.corlib, "System.Threading", "StWaitBlock");
 
 	/*
 	 * mscorlib needs a little help, only now it can load its friends list (after we have

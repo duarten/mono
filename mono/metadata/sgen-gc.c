@@ -1055,6 +1055,10 @@ is_xdomain_ref_allowed (gpointer *ptr, char *obj, MonoDomain *domain)
 	MonoObject *ref = (MonoObject*)*(ptr);
 	int offset = (char*)(ptr) - (char*)o;
 
+	if (o->vtable->klass == mono_defaults.st_waitblock_class)
+		return TRUE;
+	if (mono_class_has_parent (o->vtable->klass, mono_defaults.st_waitable_class))
+		return TRUE;
 	if (o->vtable->klass == mono_defaults.thread_class && offset == G_STRUCT_OFFSET (MonoThread, internal_thread))
 		return TRUE;
 	if (o->vtable->klass == mono_defaults.internal_thread_class && offset == G_STRUCT_OFFSET (MonoInternalThread, current_appcontext))

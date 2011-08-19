@@ -39,63 +39,51 @@ namespace System.Threading
 	[ComVisible (false)]
 	public class AbandonedMutexException : SystemException
 	{
-		Mutex mutex;
-		int mutex_index = -1;
-		
+		private int mutex_index = -1;
+
 		public AbandonedMutexException()
 			: base ("Mutex was abandoned")
-		{
-		}
+		{ }
 
 		public AbandonedMutexException (string message)
 			: base (message)
-		{
-		}
+		{ }
 
 		public AbandonedMutexException (int location, WaitHandle handle)
 			: base ("Mutex was abandoned")
 		{
 			mutex_index = location;
-			mutex = handle as Mutex;
+			Mutex = handle as Mutex;
 		}
 		
 
 		protected AbandonedMutexException (SerializationInfo info, StreamingContext context)
 			: base (info, context)
-		{
-		}
+		{ }
 
 		public AbandonedMutexException (string message, Exception inner)
 			: base (message, inner)
-		{
-		}
+		{ }
 
 		public AbandonedMutexException (string message, int location, WaitHandle handle)
 			: base (message)
 		{
 			mutex_index = location;
-			mutex = handle as Mutex;
+			Mutex = handle as Mutex;
 		}
 
 		public AbandonedMutexException (string message, Exception inner, int location, WaitHandle handle)
 			: base (message, inner)
 		{
 			mutex_index = location;
-			mutex = handle as Mutex;
+			Mutex = handle as Mutex;
 		}
 
-		public Mutex Mutex
-		{
-			get {
-				return(mutex);
-			}
+		public int MutexIndex {
+			get { return mutex_index; } 
+			internal set { mutex_index = value; }
 		}
 
-		public int MutexIndex
-		{
-			get {
-				return(mutex_index);
-			}
-		}
+		public Mutex Mutex { get; internal set; }
 	}
 }

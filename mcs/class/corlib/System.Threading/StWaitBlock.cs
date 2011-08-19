@@ -22,15 +22,7 @@
 
 namespace System.Threading
 {
-    //
-    // The enumerate type used to defines the two possible types of wait.
-    //
-
-    internal enum WaitType
-    {
-        WaitAll,
-        WaitAny
-    } ;
+    internal enum WaitType { WaitAll, WaitAny };
 
     //
     // The wait block used with waitables, locks and condition variables.
@@ -38,52 +30,28 @@ namespace System.Threading
 
     internal sealed class StWaitBlock
     {
-        //
-        // A wait block used as sentinel to several purposes.
-        //
-
         internal static readonly StWaitBlock SENTINEL = new StWaitBlock ();
-
-        //
-        // The link field used by the wait queues.
-        //
 
         internal volatile StWaitBlock next;
 
-        //
-        // The associated parker.
-        //
-
         internal readonly StParker parker;
-
-        //
-        // The type of wait.
-        //
-
         internal readonly WaitType waitType;
-
-        //
-        // The *request* field is enconded as follows:
-        // - bit 31 - set one the request is a locked request.
-        // - bit 30 - set when the request is a special request.
-        // - bits 29, 0 - request type.
-        //
 
         internal const int LOCKED_REQUEST = (1 << 31);
         internal const int SPECIAL_REQUEST = (1 << 30);
         internal const int MAX_REQUEST = (SPECIAL_REQUEST - 1);
         internal volatile int request;
 
-        //
-        // The wait status specified when the owner thread of the wait
-        // block is unparked.
-        //
+        /*
+         * The wait status specified when the owner thread of the wait
+         * block is unparked.
+         */
 
         internal readonly int waitKey;
 
-        //
-        // Constructor used with sentinel wait blocks.
-        //
+        /*
+         * Constructor used with sentinel wait blocks.
+         */
 
         internal StWaitBlock ()
         {
@@ -133,105 +101,46 @@ namespace System.Threading
             request = r;
         }
 
-        //
-        // CASes on the *next* field.
-        //
-
-        internal bool CasNext (StWaitBlock n, StWaitBlock nn)
+       internal bool CasNext (StWaitBlock n, StWaitBlock nn)
         {
             return (next == n && Interlocked.CompareExchange (ref next, nn, n) == n);
         }
     }
 
-    //
-    // A non-thread-safe queue of wait blocks.
-    //
+    /*
+     * A non-thread-safe queue of wait blocks.
+     */
 
-    internal struct WaitBlockQueue
-    {
-        //
-        // The first and last wait blocks.
-        //
-
+    internal struct WaitBlockQueue {
         internal StWaitBlock head;
         private StWaitBlock tail;
 
-        //
-        // Clears the queue.
-        //
-
-        internal void Clear ()
-        {
-            head = tail = null;
-        }
-
-        //
-        // Enqueues a wait block at the tail of the queue.
-        //
-
-        internal void Enqueue (StWaitBlock wb)
-        {
+        internal void Enqueue(StWaitBlock wb) {
             if (head == null) {
                 head = wb;
-            }
-            else {
+            } else {
                 tail.next = wb;
             }
             tail = wb;
         }
 
-        //
-        // Enqueues a wait block at head of the queue.
-        //
-
-        internal void EnqueueHead (StWaitBlock wb)
-        {
-            if ((wb.next = head) == null) {
-                tail = wb;
+        internal StWaitBlock Dequeue() {
+            StWaitBlock wb;
+            if ((wb = head) == null) {
+                return null;
             }
-            head = wb;
-        }
 
-        //
-        // Dequeues a wait node from a non-empty queue.
-        //
-
-        internal StWaitBlock Dequeue ()
-        {
-            StWaitBlock wb = head;
             if ((head = wb.next) == null) {
                 tail = null;
             }
-            wb.next = wb; // Mark the wait block as unlinked.
             return wb;
         }
 
-        //
-        // Returns true if the queue is empty.
-        //
-
-        internal bool IsEmpty
-        {
-            get { return head == null; }
-        }
-
-        //
-        // Removes the specified wait node from the queue.
-        //
-
-        internal void Remove (StWaitBlock wb)
-        {
-            //
-            // If the wait block was already unlinked, return.
-            //
+        internal void Remove(StWaitBlock wb) {
 
             if (wb.next == wb) {
                 return;
             }
-
-            //
-            // Compute the previous wait block and perform the removal.
-            //
 
             StWaitBlock p = head;
             StWaitBlock pv = null;
@@ -241,11 +150,9 @@ namespace System.Threading
                         if ((head = wb.next) == null) {
                             tail = null;
                         }
-                    }
-                    else {
-                        if ((pv.next = wb.next) == null) {
+                    } else {
+                        if ((pv.next = wb.next) == null)
                             tail = pv;
-                        }
                     }
                     wb.next = wb;
                     return;
@@ -253,198 +160,110 @@ namespace System.Threading
                 pv = p;
                 p = p.next;
             }
-            throw new InvalidOperationException ();
+            
+            throw new InvalidOperationException();
         }
     }
 
-    //
-    // A queue of wait blocks that allows non-blocking enqueue
-    // and lock-protected dequeue.
-    //
+   /*
+    * A queue of wait blocks that allows non-blocking enqueue
+    * and lock-protected dequeue.
+    */
 
-    internal struct LockedWaitQueue
-    {
-        //
-        // The head and tail of the queue.
-        //
+   internal struct LockedWaitQueue
+   {
+      internal volatile StWaitBlock head;
+      internal volatile StWaitBlock tail;
 
-        internal volatile StWaitBlock head;
-        internal volatile StWaitBlock tail;
+      private const int FREE = 0;
+      private const int BUSY = 1;
+      private volatile int qlock;
 
-        //
-        // The queue lock's state. This lock has no wait queue because
-        // it is always acquired with TryEnter.
-        //
+      internal void Init ()
+      {
+         head = tail = new StWaitBlock ();
+      }
 
-        private const int FREE = 0;
-        private const int BUSY = 1;
-        private volatile int qlock;
+      internal StWaitBlock First {
+         get { return qlock == FREE ? head.next : null; }
+      }
 
-        //
-        // Initializes the queue.
-        //
+      internal bool IsEmpty {
+         get { return head.next == null; }
+      }
 
-        internal void Init ()
-        {
-            head = tail = new StWaitBlock ();
-        }
+		internal bool TryLock ()
+      {
+         return qlock == FREE && Interlocked.CompareExchange (ref qlock, BUSY, FREE) == FREE;
+      }
 
-        //
-        // Advances the queue's head.
-        //
+      internal bool Enqueue (StWaitBlock wb)
+      {
+         do {
+				StWaitBlock t = tail;
 
-        private bool AdvanceHead (StWaitBlock h, StWaitBlock nh)
-        {
-            if (head == h && Interlocked.CompareExchange<StWaitBlock> (ref head, nh, h) == h) {
-                h.next = h; // Mark the previous head's wait block as unlinked.
-                return true;
+				if (t == null) {
+					wb.next = wb;
+					return false; // Useful for the inflate operation.
+				}
+
+				StWaitBlock tn = t.next;
+
+				if (tn != null) {
+					AdvanceTail (t, tn);
+					continue;
+				}
+
+				if (t.CasNext (null, wb)) {
+					AdvanceTail (t, wb);
+					return t == head;
+				}
+         } while (true);
+      }
+
+     internal void SetHeadAndUnlock (StWaitBlock nh)
+		{
+			do {
+				StWaitBlock w;
+            if ((w = nh.next) == null || !w.parker.IsLocked || w.request < 0) {
+               break;
             }
-            return false;
-        }
+            nh.next = nh; // Mark old head's wait block as unlinked.
+            nh = w;
+         } while (true);
 
-        //
-        // Advances the queue's tail.
-        //
+         head = nh;
+         Interlocked.Exchange (ref qlock, FREE);
+      }
 
-        private bool AdvanceTail (StWaitBlock t, StWaitBlock nt)
-        {
-            return (tail == t && Interlocked.CompareExchange<StWaitBlock> (ref tail, nt, t) == t);
-        }
+      internal void Unlink (StWaitBlock wb)
+      {
+         if (wb.next == wb || wb == head) {
+            return;
+         }
 
-        //
-        // Enqueues the specified wait block and returns its
-        // predecessor.
-        //
-
-        internal bool Enqueue (StWaitBlock wb)
-        {
-            do {
-                StWaitBlock t = tail;
-                StWaitBlock tn = t.next;
-
-                //
-                // Do the necessary consistency checks.
-                //
-
-                if (t != tail) {
-                    continue;
-                }
-                if (tn != null) {
-                    AdvanceTail (t, tn);
-                    continue;
-                }
-
-                //
-                // Queue in quiescent state, try to insert the wait block.
-                //
-
-                if (t.CasNext (null, wb)) {
-                    //
-                    // Enqueue succeed; So, try to swing tail to the inserted
-                    // wait block and return.
-                    //
-
-                    AdvanceTail (t, wb);
-                    return (t == head);
-                }
+         StWaitBlock n;
+         StWaitBlock pv = head;
+         while ((n = pv.next) != wb) {
+            if (n.parker.IsLocked) {
+               pv.next = n.next;
+               n.next = n;
+            } else {
+               pv = n;
             }
-            while (true);
-        }
+         }
 
-        //
-        // If the queue is not locked, returns the wait block that
-        // is at the front of the queue; otherwise, returns always null.
-        //
+         do {
+            pv.next = n.next;
+            n.next = n;
+         } while ((n = pv.next).next != null && n.parker.IsLocked);
+      }
 
-        internal StWaitBlock First
-        {
-            get { return (qlock == FREE) ? head.next : null; }
-        }
-
-        //
-        // Returns true if the waiting queue seems empty.
-        //
-
-        internal bool IsEmpty
-        {
-            get { return head.next == null; }
-        }
-
-        //
-        // Tries to lock the queue if it is free.
-        //
-
-        internal bool TryLock ()
-        {
-            return (qlock == FREE && Interlocked.CompareExchange (ref qlock, BUSY, FREE) == FREE);
-        }
-
-        //
-        // Sets the new head and unlocks the queue.
-        //
-
-        internal void SetHeadAndUnlock (StWaitBlock nh)
-        {
-            //
-            // First, remove the cancelled wait blocks that follow the
-            // new queue's head.
-            //
-
-            do {
-                StWaitBlock w;
-                if ((w = nh.next) == null || !w.parker.IsLocked || w.request < 0) {
-                    break;
-                }
-                nh.next = nh; // Mark old head's wait block as unlinked.
-                nh = w;
-            }
-            while (true);
-
-            //
-            // Set the new head and release the queue lock, making
-            // the lock and queue changes visible to all processors.
-            //
-
-            head = nh;
-            Interlocked.Exchange (ref qlock, FREE);
-        }
-
-        //
-        // Unlinks the specified wait block.
-        //
-
-        internal void Unlink (StWaitBlock wb)
-        {
-            if (wb.next == wb || wb == head) {
-                return;
-            }
-
-            //
-            // Remove the cancelled wait nodes from *head* till *wb*.
-            //
-
-            StWaitBlock n;
-            StWaitBlock pv = head;
-            while ((n = pv.next) != wb) {
-                if (n.parker.IsLocked) {
-                    pv.next = n.next;
-                    n.next = n;
-                }
-                else {
-                    pv = n;
-                }
-            }
-
-            //
-            // Remove the wait block *wb* and also the cancelled wait
-            // blocks that follow it.
-            //
-
-            do {
-                pv.next = n.next;
-                n.next = n;
-            }
-            while ((n = pv.next).next != null && n.parker.IsLocked);
-        }
-    }
+		private void AdvanceTail (StWaitBlock t, StWaitBlock nt)
+      {
+			if (tail == t) {
+				Interlocked.CompareExchange (ref tail, nt, t);
+         }
+      }
+	}
 }

@@ -17,30 +17,29 @@
 //
 // Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
-
- #if NET_2_0
  
 #pragma warning disable 0420
 
 namespace System.Threading 
 {
-	internal sealed class StSemaphore : StWaitable
-	{
+	public sealed class StSemaphore : StWaitable {
+		private const int SEM_INFLATED = -1;
+
 		private volatile int state;
 		private LockedWaitQueue queue;
-
 		private readonly int maximumCount;
-
 		private readonly int spinCount;
 
-		internal StSemaphore (int count, int maximumCount, int spinCount)
+		public StSemaphore (int count, int maximumCount, int spinCount)
 		{
 			if (count < 0 || count > maximumCount) {
-				throw new ArgumentException ("\"count\": incorrect value");
+				throw new ArgumentOutOfRangeException ("count");
 			}
+
 			if (maximumCount <= 0) {
-				throw new ArgumentException ("\"maximumCount\": incorrect value");
+				throw new ArgumentOutOfRangeException ("maximumCount");
 			}
+			
 			queue.Init ();
 			state = count;
 			this.maximumCount = maximumCount;
@@ -56,8 +55,28 @@ namespace System.Threading
 		internal int CurrentCount {
 			get { return state; }
 		}
+				
+		internal override bool _AllowsAcquire {
+			get { return state > 0 && queue.IsEmpty; }
+		}
+		
+		/*
+		 * If at least one waiter can be released, or the first is waiter is locked,
+		 * returns true with the semaphore's queue locked; otherwise returns false.
+		 */
 
-		internal bool Wait (int acquireCount, StCancelArgs cargs)
+		private bool IsReleasePending {
+			get {
+				StWaitBlock w = queue.First;
+				return w != null && (state >= w.request || w.parker.IsLocked) && queue.TryLock();
+			}
+		}
+
+		/*
+		 * No need to worry about inflating as this is not called by Semaphore.
+		 */
+
+		internal bool TryWait (int acquireCount, StCancelArgs cargs)
 		{
 			if (acquireCount <= 0 || acquireCount > maximumCount) {
 				throw new ArgumentException ("acquireCount");
@@ -75,50 +94,147 @@ namespace System.Threading
 			int sc = EnqueueAcquire (wb, acquireCount);
 
 			int ws = wb.parker.Park (sc, cargs);
-
 			if (ws == StParkStatus.Success) {
 				return true;
 			}
 
 			CancelAcquire (wb);
-			StCancelArgs.ThrowIfException (ws);
+			cargs.ThrowIfException (ws);
 			return false;
 		}
 
 		internal void Wait (int acount)
 		{
-			Wait (acount, StCancelArgs.None);
+			TryWait (acount, StCancelArgs.None);
 		}
 
-		internal int Release(int releaseCount)
+		internal int Release (int releaseCount)
 		{
 			if (releaseCount < 1) {
 				throw new ArgumentOutOfRangeException("releaseCount");
 			}
 
-			int prevCount = state;
-			if (!ReleaseInternal (releaseCount)) {
-				//throw new SemaphoreFullException ();
-			}
-			if (IsReleasePending) {
-				ReleaseWaitersAndUnlockQueue ();
+			int prevCount;
+			if (!ReleaseInternal (releaseCount, out prevCount)) {
+				throw _SignalException;
 			}
 			return prevCount;
 		}
+		
+		internal override bool _TryAcquire ()
+		{
+			return TryAcquireInternal (1);
+		}
+		
+		internal override bool _Release ()
+		{
+			int ignored;
+			return ReleaseInternal (1, out ignored);
+		}
+
+		internal override StWaitBlock _Inflate()
+		{
+#if NET_4_0 
+			var spinWait = new SpinWait ();
+#endif
+
+			while (!queue.TryLock ()) {
+#if NET_4_0 								
+				spinWait.SpinOnce ();
+#else
+				Thread.SpinWait (1);
+#endif		
+			}
+
+			int currentCount = Interlocked.Exchange (ref state, SEM_INFLATED);
+			
+			int ignored;
+			StInternalMethods.ReleaseSemaphore (swhandle.DangerousGetHandle (), currentCount, out ignored);
+			
+			StWaitBlock wb = queue.head;
+			queue.head = queue.tail = null; // Synchronize with a pending Enqueue.
+			return wb;
+		}
+
+		internal override IntPtr _CreateNativeObject()
+		{
+			return StInternalMethods.CreateSemaphore (IntPtr.Zero, 0, maximumCount, null);
+		}
+
+		internal override StWaitBlock _WaitAnyPrologue (StParker pk, int key,
+																		ref StWaitBlock hint, ref int sc)
+		{
+			return TryAcquireInternal (1)
+				  ? null
+			     : WaitPrologue(pk, WaitType.WaitAny, key, ref hint, ref sc);
+		}
+
+		internal override StWaitBlock _WaitAllPrologue (StParker pk, ref StWaitBlock hint,
+																		ref int sc) {
+			return _AllowsAcquire
+				  ? null
+			     : WaitPrologue(pk, WaitType.WaitAll, StParkStatus.StateChange, ref hint, ref sc);
+		}
+
+		private StWaitBlock WaitPrologue (StParker pk, WaitType type, int key, 
+													 ref StWaitBlock hint, ref int sc) 
+		{
+			if (state == SEM_INFLATED) {
+				hint = INFLATED;
+				return null;
+			}
+
+			var wb = new StWaitBlock (pk, type, 1, key);
+			sc = EnqueueAcquire (wb, 1);
+			
+			if (state == SEM_INFLATED && pk.TryCancel ()) {
+				pk.UnparkSelf (StParkStatus.Inflated);
+				hint = INFLATED;
+				return null;
+			}
+
+			return wb;
+		}
+
+		internal override void _UndoAcquire ()
+		{
+			UndoAcquire (1);
+			if (IsReleasePending) {
+				ReleaseWaitersAndUnlockQueue (null);
+			}
+		}
+
+		internal override void _CancelAcquire (StWaitBlock wb, StWaitBlock ignored)
+		{
+			CancelAcquire (wb);
+		}
+
+#if NET_4_0
+		internal override Exception _SignalException {
+			get { return new SemaphoreFullException (); }
+		}
+#else
+		public delegate Exception SignalExceptionFactory();
+		public SignalExceptionFactory SignalException { get; set; }
+
+		internal override Exception _SignalException {
+			get { return SignalException(); }
+		}
+#endif
 
 		private bool TryAcquireInternal (int acquireCount)
 		{
 			do {
 				int s;
 				int ns = (s = state) - acquireCount;
+
 				if (ns < 0 || !queue.IsEmpty) {
 					return false;
 				}
 				if (Interlocked.CompareExchange (ref state, ns, s) == s) {
 					return true;
 				}
-			}
-			while (true);
+			} while (true);
 		}
 
 		private bool TryAcquireInternalQueued (int acquireCount)
@@ -132,222 +248,150 @@ namespace System.Threading
 				if (Interlocked.CompareExchange (ref state, ns, s) == s) {
 					return true;
 				}
-			}
-			while (true);
+			} while (true);
 		}
 
-		private void UndoAcquire (int undoCount)
-		{
-			do {
-				int s = state;
-				if (Interlocked.CompareExchange (ref state, s + undoCount, s) == s) {
-					return;
-				}
-			}
-			while (true);
-		}
-
-		private bool ReleaseInternal (int releaseCount)
-		{
-			do {
-				int s;
-				int ns = (s = state) + releaseCount;
-				if (ns < 0 || ns > maximumCount) {
-					return false;
-				}
-				if (Interlocked.CompareExchange (ref state, ns, s) == s) {
-					return true;
-				}
-			}
-			while (true);
-		}
-
-		private bool IsReleasePending {
-			get
-			{
-				StWaitBlock w = queue.First;
-				return (w != null && (state >= w.request || w.parker.IsLocked) && queue.TryLock ());
-			}
-		}
-
-		private void ReleaseWaitersAndUnlockQueue ()
-		{
+		private void ReleaseWaitersAndUnlockQueue(StWaitBlock self) {
 			do {
 				StWaitBlock qh = queue.head;
-				StWaitBlock w;
+				StWaitBlock  w;
+
 				while (state > 0 && (w = qh.next) != null) {
 					StParker pk = w.parker;
+
 					if (w.waitType == WaitType.WaitAny) {
-
-						//
-						// Try to acquire the requested permits on behalf of the
-						// queued waiter.
-						//
-
 						if (!TryAcquireInternalQueued (w.request)) {
 							break;
 						}
 
-
 						if (pk.TryLock ()) {
-							pk.Unpark (w.waitKey);
-						}
-						else {
+							if (w == self) {
+								pk.UnparkSelf (w.waitKey);
+							} else {
+								pk.Unpark (w.waitKey);
+							}
+						} else {
 							UndoAcquire (w.request);
 						}
-					}
-					else {
-
-						//
-						// Wait-all: since that the semaphore seems to have at least
-						// one available permit, lock the parker and, if this is the last
-						// cooperative release, unpark its owner thread.
-						//
-
-						if (pk.TryLock ()) {
+					} else if (pk.TryLock ()) {
+						if (w == self) {
+							pk.UnparkSelf (w.waitKey);
+						} else {
 							pk.Unpark (w.waitKey);
 						}
 					}
-
-					//
-					// Remove the wait block from the semaphore's queue,
-					// marking the previous head as unlinked, and advance 
-					// the head of the local queues.
-					//
 
 					qh.next = qh;
 					qh = w;
 				}
 
-				//
-				// It seems that no more waiters can be released; so,
-				// set the new semaphore queue's head and unlock it.
-				//
-
 				queue.SetHeadAndUnlock (qh);
-
-				//
-				// If, after the semaphore's queue is unlocked, it seems
-				// that more waiters can be released, repeat the release
-				// processing.
-				//
-
-				if (!IsReleasePending) {
-					return;
-				}
-			}
-			while (true);
+			} while (IsReleasePending);
 		}
 
-		private void CancelAcquire (StWaitBlock wb)
+		private bool ReleaseInternal (int releaseCount, out int prevCount)
 		{
-			//
-			// If the wait block is still linked and it isn't the last wait block
-			// of the queue and the queue's lock is free unlink the wait block.
-			//
+			do {
+				int ns = (prevCount = state) + releaseCount;
 
-			StWaitBlock wbn;
-			if ((wbn = wb.next) != wb && wbn != null && queue.TryLock ()) {
-				queue.Unlink (wb);
-				ReleaseWaitersAndUnlockQueue ();
-			}
+				if (prevCount == SEM_INFLATED) {
+
+					/*
+					 * We must wait until the inflation is complete so that we don't compete 
+					 * with the inflater by releasing permits that could fill the semaphore.
+					 */
+
+#if NET_4_0 
+					var spinWait = new SpinWait ();
+#endif
+
+					while (queue.head != null) {
+#if NET_4_0
+						spinWait.SpinOnce ();
+#else
+						Thread.SpinWait (1);
+#endif
+					}
+					
+					bool release = false;
+					try {
+						swhandle.DangerousAddRef (ref release);
+						return StInternalMethods.ReleaseSemaphore (swhandle.DangerousGetHandle (), releaseCount,
+						                                           out prevCount);
+					} finally {
+						if (release) {
+							swhandle.DangerousRelease ();
+						}
+					}
+				}
+
+				if (ns < 0 || ns > maximumCount) {
+					return false;
+				}
+
+				if (Interlocked.CompareExchange (ref state, ns, prevCount) == prevCount) {
+					if (IsReleasePending) {
+						ReleaseWaitersAndUnlockQueue (null);
+					}
+					return true;
+				}
+			} while (true);
 		}
 
 		private int EnqueueAcquire (StWaitBlock wb, int acquireCount)
 		{
 			bool isFirst = queue.Enqueue (wb);
 
-			//
-			// If the wait block was inserted at front of the semaphore's
-			// queue, re-check if the current thread is at front of the
-			// queue and can now acquire the requested permits; if so,
-			// try lock the queue and execute the release processing.
-			//
+			/*
+			 * If the wait block was inserted at the front of the queue and
+			 * the current thread can now acquire the requested permits, try 
+			 * to lock the queue and execute the release processing.
+			 */
 
 			if (isFirst && state >= acquireCount && queue.TryLock ()) {
-				ReleaseWaitersAndUnlockQueue ();
+				ReleaseWaitersAndUnlockQueue (wb);
 			}
 
-			return (isFirst ? spinCount : 0);
+			return isFirst ? spinCount : 0;
 		}
-
-		internal override bool _AllowsAcquire
+		
+		private void UndoAcquire (int undoCount)
 		{
-			get { return (state != 0 && queue.IsEmpty); }
-		}
+			do {
+				int s = state;
 
-		internal override bool _TryAcquire ()
-		{
-			return TryAcquireInternal (1);
-		}
-
-		internal override bool _Release ()
-		{
-			if (!ReleaseInternal (1)) {
-				return false;
-			}
-			if (IsReleasePending) {
-				ReleaseWaitersAndUnlockQueue ();
-			}
-			return true;
-		}
-
-		internal override StWaitBlock _WaitAnyPrologue (StParker pk, int key,
-														ref StWaitBlock ignored, ref int sc)
-		{
-			if (TryAcquireInternal (1)) {
-				if (pk.TryLock ()) {
-					pk.UnparkSelf (key);
-				}
-				else {
-					UndoAcquire (1);
-					if (IsReleasePending) {
-						ReleaseWaitersAndUnlockQueue ();
+				if (s == SEM_INFLATED) {
+					int ignored;
+					bool release = false;
+					try {
+						swhandle.DangerousAddRef (ref release);
+						StInternalMethods.ReleaseSemaphore(swhandle.DangerousGetHandle(), undoCount, out ignored);
+					} finally {
+						if (release) {
+							swhandle.DangerousRelease ();
+						}
 					}
+					return;
 				}
 
-				//
-				// Return null because no wait block was inserted on the
-				// semaphore's wait queue.
-				//
-
-				return null;
-			}
-
-			var wb = new StWaitBlock (pk, WaitType.WaitAny, 1, key);
-			sc = EnqueueAcquire (wb, 1);
-			return wb;
-		}
-
-		internal override StWaitBlock _WaitAllPrologue (StParker pk, ref StWaitBlock ignored,
-														ref int sc)
-		{
-			if (_AllowsAcquire) {
-				if (pk.TryLock ()) {
-					pk.UnparkSelf (StParkStatus.StateChange);
+				if (Interlocked.CompareExchange (ref state, s + undoCount, s) == s) {
+					return;
 				}
-				return null;
-			}
-
-			var wb = new StWaitBlock (pk, WaitType.WaitAll, 1, StParkStatus.StateChange);
-			sc = EnqueueAcquire (wb, 1);
-
-			return wb;
+			} while (true);
 		}
 
-		internal override void _UndoAcquire ()
+		private void CancelAcquire (StWaitBlock wb)
 		{
-			UndoAcquire (1);
-			if (IsReleasePending) {
-				ReleaseWaitersAndUnlockQueue ();
-			}
-		}
+			/*
+			 * If the wait block is still linked and it isn't the last wait block
+			 * of the queue and the queue's lock is free unlink the wait block.
+			 */
 
-		internal override void _CancelAcquire (StWaitBlock wb, StWaitBlock ignored)
-		{
-			CancelAcquire (wb);
+			StWaitBlock wbn;
+			if ((wbn = wb.next) != wb && wbn != null && queue.TryLock ()) {
+				queue.Unlink (wb);
+				ReleaseWaitersAndUnlockQueue (null);
+			}
 		}
 	}
 }
-
-#endif

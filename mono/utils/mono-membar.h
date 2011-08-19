@@ -35,7 +35,7 @@ static inline void mono_memory_write_barrier (void)
 
 static inline void mono_memory_barrier (void)
 {
-	_ReadWriteBarrier ();
+	MemoryBarrier ();
 }
 
 static inline void mono_memory_read_barrier (void)
@@ -69,7 +69,7 @@ static inline void mono_memory_write_barrier (void)
 
 static inline void mono_memory_barrier (void)
 {
-	_ReadWriteBarrier ();
+	MemoryBarrier ();
 }
 
 static inline void mono_memory_read_barrier (void)

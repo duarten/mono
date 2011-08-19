@@ -34,32 +34,21 @@ using System.Security.AccessControl;
 using System.Runtime.CompilerServices;
 using System.IO;
 
-namespace System.Threading {
-
+namespace System.Threading 
+{
 	[ComVisible (false)]
-	public sealed class Semaphore : WaitHandle {
-
-		[MethodImplAttribute(MethodImplOptions.InternalCall)]
-		private static extern IntPtr CreateSemaphore_internal (
-			int initialCount, int maximumCount, string name,
-			out bool createdNew);
-
-		[MethodImplAttribute(MethodImplOptions.InternalCall)]
-		private static extern int ReleaseSemaphore_internal (
-			IntPtr handle, int releaseCount, out bool fail);
-
-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
-		private static extern IntPtr OpenSemaphore_internal (string name, SemaphoreRights rights, out MonoIOError error);
-		
-		private Semaphore (IntPtr handle)
-		{
-			Handle = handle;
-		}
+	public sealed class Semaphore : WaitHandle 
+	{
+		private const int defaultSpinCount = 256;
 		
 		public Semaphore (int initialCount, int maximumCount)
-			: this (initialCount, maximumCount, null)
-		{
-		}
+			: base (
+			new StSemaphore (initialCount, maximumCount) 
+#if !NET_4_0
+			{ _SignalException = () => { throw new SemaphoreFullException (); } }
+#endif
+			)
+		{ }
 
 		public Semaphore (int initialCount, int maximumCount, string name)
 		{
@@ -70,17 +59,12 @@ namespace System.Threading {
 			if (initialCount > maximumCount)
 				throw new ArgumentException ("initialCount > maximumCount");
 
-			bool created;
-			
-			Handle = CreateSemaphore_internal (initialCount,
-							   maximumCount, name,
-							   out created);
+			throw new NotImplementedException ();
 		}
 
 		public Semaphore (int initialCount, int maximumCount, string name, out bool createdNew)
 			: this (initialCount, maximumCount, name, out createdNew, null)
-		{
-		}
+		{ 		}
 
 		[MonoTODO ("Does not support access control, semaphoreSecurity is ignored")]
 		public Semaphore (int initialCount, int maximumCount, string name, out bool createdNew, 
@@ -93,9 +77,7 @@ namespace System.Threading {
 			if (initialCount > maximumCount)
 				throw new ArgumentException ("initialCount > maximumCount");
 
-			Handle = CreateSemaphore_internal (initialCount,
-							   maximumCount, name,
-							   out createdNew);
+			throw new NotImplementedException ();
 		}
 
 		[MonoTODO]
@@ -108,7 +90,7 @@ namespace System.Threading {
 		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
 		public int Release ()
 		{
-			return (Release (1));
+			return Release (1);
 		}
 
 		[ReliabilityContract (Consistency.WillNotCorruptState, Cer.Success)]
@@ -117,17 +99,18 @@ namespace System.Threading {
 			if (releaseCount < 1)
 				throw new ArgumentOutOfRangeException ("releaseCount");
 
-			int ret;
-			bool fail;
-			
-			ret = ReleaseSemaphore_internal (Handle, releaseCount,
-							 out fail);
+			var sem = Waitable as StSemaphore;
+			return sem != null ? sem.Release(releaseCount) : 0; 
+			return 0;
+		}
 
-			if (fail) {
-				throw new SemaphoreFullException ();
-			}
-
-			return (ret);
+		internal override StWaitable CreateWaitable () 
+		{
+			return new StSemaphore (initialCount, maximumCount) 
+#if !NET_4_0
+			{ _SignalException = () => { throw new SemaphoreFullException (); } }
+#endif
+			;
 		}
 
 		[MonoTODO]
@@ -153,6 +136,9 @@ namespace System.Threading {
 			if ((name.Length ==0) || (name.Length > 260))
 				throw new ArgumentException ("name", Locale.GetText ("Invalid length [1-260]."));
 
+			throw new NotImplementedException ();
+
+			/*
 			MonoIOError error;
 			IntPtr handle = OpenSemaphore_internal (name, rights,
 								out error);
@@ -166,7 +152,8 @@ namespace System.Threading {
 				}
 			}
 			
-			return(new Semaphore (handle));
+			return new Semaphore (handle);
+			*/
 		}
 	}
 }

@@ -1,22 +1,30 @@
+﻿// 
+// CancellationTokenSource.cs
+//  
+// Author:
+//			Jérémie "Garuma" Laval <jeremie.laval@gmail.com>
+//			Duarte Nunes <duarte.m.nunes@gmail.com>
 // 
-// System.Threading.CancellationTokenSource.cs
-//
-// Copyright 2011 Duarte Nunes
+// Copyright (c) 2009 Jérémie "Garuma" Laval
+// Copyright (c) 2011 Duarte Nunes
 // 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
 // 
-// http://www.apache.org/licenses/LICENSE-2.0
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 // 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Author: Duarte Nunes (duarte.m.nunes@gmail.com)
-//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
 
 #if NET_4_0 || MOBILE
 
@@ -26,255 +34,262 @@ using System.Collections.Generic;
 
 namespace System.Threading
 {
-    public sealed class CancellationTokenSource : IDisposable
-    {
-        private const CancelHandler NOT_CANCELLED = null;
-        private static readonly CancelHandler CANNOT_BE_CANCELLED = new CancelHandler ();
-        private static readonly CancelHandler CANCELLED = new CancelHandler ();
-        private static readonly CancelHandler DISPOSED = new CancelHandler ();
 
-        internal static readonly CancellationTokenSource CTS_CANCELLED =
-            new CancellationTokenSource (true);
+	public sealed class CancellationTokenSource : IDisposable
+   {
+		private const StParker NOT_CANCELLED = null;
+      private static readonly StParker CANNOT_BE_CANCELLED = new SentinelParker ();
+		private static readonly StParker CANCELLED = new SentinelParker ();
+		private static readonly StParker DISPOSED = new SentinelParker ();
 
-        internal static readonly CancellationTokenSource CTS_NOT_CANCELABLE =
-            new CancellationTokenSource (false);
+		internal static readonly CancellationTokenSource CTS_CANCELLED =
+         new CancellationTokenSource (true);
 
-        private volatile CancelHandler state;
-        private volatile ManualResetEvent evt;
+      internal static readonly CancellationTokenSource CTS_NOT_CANCELABLE =
+         new CancellationTokenSource (false);
 
-        private List<CancellationTokenRegistration> ctrList;
+      private volatile StParker state;
+      private volatile ManualResetEvent evt;
 
-        public CancellationTokenSource ()
-        {
-            state = NOT_CANCELLED;
-        }
+      private List<CancellationTokenRegistration> ctrList;
 
-        private CancellationTokenSource (bool cancelled)
-        {
-            state = cancelled ? CANCELLED : CANNOT_BE_CANCELLED;
-        }
+      public CancellationTokenSource ()
+      {
+         state = NOT_CANCELLED;
+      }
 
-        internal bool CanBeCanceled {
-            get { return state != CANNOT_BE_CANCELLED; }
-        }
+      private CancellationTokenSource (bool cancelled)
+      {
+			state = cancelled ? CANCELLED : CANNOT_BE_CANCELLED;
+      }
 
-        public bool IsCancellationRequested {
-            get { return state == CANCELLED; }
-        }
-
-        public CancellationToken Token {
-            get {
-                ThrowIfDisposed ();
-                return new CancellationToken (this);
-            }
-        }
-
-        internal WaitHandle WaitHandle {
-            get {
-                ThrowIfDisposed ();
-
-                if (evt != null) {
-                    return evt;
-                }
-
-                var nevt = new ManualResetEvent (false);
-                nevt = Interlocked.CompareExchange (ref evt, nevt, null) ?? nevt;
-
-                if (IsCancellationRequested) {
-                    nevt.Set ();
-                }
-
-                return nevt;
-            }
-        }
-
-        public void Cancel ()
-        {
-            Cancel (false);
-        }
-
-        public void Cancel (bool throwOnFirstException)
-        {
+      public CancellationToken Token {
+         get {
             ThrowIfDisposed ();
+            return new CancellationToken (this);
+         }
+      }
+		
+      internal bool CanBeCanceled {
+         get { return state != CANNOT_BE_CANCELLED; }
+      }
 
-            CancelHandler ch = state;
-            if (ch == CANCELLED || (ch = Interlocked.Exchange (ref state, CANCELLED)) == CANCELLED) {
-                return;
+      public bool IsCancellationRequested {
+         get { return state == CANCELLED; }
+      }
+				
+      internal WaitHandle WaitHandle {
+			get {
+				ThrowIfDisposed ();
+
+				if (evt != null) {
+					return evt;
+				}
+
+				var nevt = new ManualResetEvent (false);
+				nevt = Interlocked.CompareExchange (ref evt, nevt, null) ?? nevt;
+
+				if (IsCancellationRequested) {
+					nevt.Set ();
+				}
+
+				return nevt;
+         }
+      }
+
+		public void Cancel (bool throwOnFirstException)
+      {
+			ThrowIfDisposed ();
+
+         StParker pk = state;
+         if (pk == CANCELLED || (pk = Interlocked.Exchange (ref state, CANCELLED)) == CANCELLED) {
+            return;
+         }
+
+         List<Exception> exnList = null;
+			while (pk != NOT_CANCELLED) {
+         	StParker pkn = pk.pnext;
+            try {
+					if (pk.TryCancel ()) {
+						pk.Unpark (StParkStatus.Cancelled);
+					}
+            } catch (Exception exn) {
+               if (throwOnFirstException) {
+                  throw;
+               }
+
+               if (exnList == null) {
+                  exnList = new List<Exception> ();
+               }
+               exnList.Add (exn);
             }
 
-            if (ch == NOT_CANCELLED) {
-                return;
+         	pk.pnext = null;
+         	pk = pkn;
+         }
+
+         if (exnList != null) {
+            throw new AggregateException (exnList);
+         }
+      }
+
+		public void Cancel ()
+		{
+			Cancel (false);
+		}
+		
+		internal bool RegisterParker (StParker pk) 
+		{
+			ThrowIfDisposed ();
+
+			if (state == CANNOT_BE_CANCELLED) {
+            throw new InvalidOperationException ("CancellationTokenSource can't be cancelled");
+         }
+
+			do {
+            StParker s;
+
+            if ((s = state) == CANCELLED) {
+               return false;
             }
 
-            List<Exception> exnList = null;
-            CancelHandler chn;
-            do {
-                chn = ch.next;
-                try {
-                    ch.ExecuteCallback ();
-                }
-                catch (Exception exn) {
-                    if (throwOnFirstException) {
-                        throw;
-                    }
-
-                    if (exnList == null) {
-                        exnList = new List<Exception> ();
-                    }
-                    exnList.Add (exn);
-                }
+            pk.pnext = s;
+            if (Interlocked.CompareExchange (ref state, pk, s) == s) {
+               return true;
             }
-            while ((ch = chn) != NOT_CANCELLED);
+         } while (true);
+		}
 
-            if (exnList != null) {
-                throw new AggregateException (exnList);
+		internal CancellationTokenRegistration RegisterInternal (Action<Object> callback, 
+																					object cbState,
+																					bool useSynchronizationContext,
+																					bool useExecutionContext)
+      {
+			if (!CanBeCanceled) {
+				return new CancellationTokenRegistration ();
+			}
+
+         var cbParker = new CbParker (_ => callback (cbState), useSynchronizationContext,
+      	                             useExecutionContext);
+
+			if (RegisterParker (cbParker) && 
+				 cbParker.EnableCallback (Timeout.Infinite) == StParkStatus.Pending) {
+				return new CancellationTokenRegistration (cbParker, this);
+			}
+
+			callback (cbState);
+			return new CancellationTokenRegistration ();
+      }
+
+		internal void DeregisterParker (StParker pk) 
+		{
+			if (pk.pnext == null && Interlocked.CompareExchange (ref state, null, pk) == pk) {
+				return;
+			}
+			SlowDeregisterParker (pk);
+		}
+
+		private void SlowDeregisterParker (StParker pk) 
+		{
+         StParker next;
+         if ((next = pk.pnext) != null && next.IsLocked) {
+            next = next.pnext;
+         }
+
+         StParker p = state;
+
+         while (p != null && p != next && state != null && !(state is SentinelParker)) {
+				StParker n = p.pnext;
+            if (n != null && n.IsLocked) {
+               p.CasNext (n, n.pnext);
+            } else {
+               p = n;
             }
-        }
+         }     
+      }
 
-        internal CancellationTokenRegistration InternalRegister (Action<object> callback,
-                                                                 object cbState,
-                                                                 SynchronizationContext sctx,
-                                                                 ExecutionContext ectx)
-        {
-            CancelHandler ch = null;
-            do {
-                ThrowIfDisposed ();
+		private static readonly Action<object> linkedCancel =
+         arg => ((CancellationTokenSource) arg).Cancel (false);
 
-                CancelHandler s;
-                if ((s = state) == CANNOT_BE_CANCELLED) {
-                    throw new InvalidOperationException (
-                        "CancellationTokenSource can't be cancelled");
-                }
+      public static CancellationTokenSource CreateLinkedTokenSource (CancellationToken token1,
+                                                                     CancellationToken token2)
+      {
+         var lcts = new CancellationTokenSource ();
 
-                if (s == CANCELLED) {
-                    break;
-                }
+			/*
+			 * We must keep a list of all registrations so we can dispose of them.
+			 */
 
-                if (ch == null) {
-                    ch = new CancelHandler (callback, cbState, sctx, ectx, this);
-                }
+         if (token1.CanBeCanceled) {
+            lcts.ctrList = new List<CancellationTokenRegistration>
+            {
+               token1.cts.RegisterInternal (linkedCancel, lcts, false, false)
+            };
+         }
 
-                ch.next = s;
-                if (Interlocked.CompareExchange (ref state, ch, s) == s) {
-                    return new CancellationTokenRegistration (this, ch);
-                }
+			if (token2.CanBeCanceled) {
+            (lcts.ctrList ?? (lcts.ctrList = new List<CancellationTokenRegistration> ()))
+					.Add (token2.cts.RegisterInternal (linkedCancel, lcts, false, false));
+         }
+
+         return lcts;
+      }
+
+      public static CancellationTokenSource CreateLinkedTokenSource (
+			params CancellationToken[] tokens)
+      {
+         if (tokens == null) {
+            throw new ArgumentNullException ("tokens");
+         }
+
+         if (tokens.Length == 0) {
+            throw new ArgumentException ("Cancellation tokens array is empty");
+         }
+
+         var lcts = new CancellationTokenSource ();
+         for (int i = 0; i < tokens.Length; i++) {
+            if (tokens[i].CanBeCanceled) {
+               (lcts.ctrList ?? (lcts.ctrList = new List<CancellationTokenRegistration> ()))
+						.Add (tokens [i].cts.RegisterInternal (linkedCancel, lcts, false, false));
             }
-            while (true);
+         }
+         return lcts;
+      }
 
-            //
-            // We get here when cancellation already occurred; so, we run the
-            // handler on the current thread and return an empty registration.
-            //
+      public void Dispose ()
+      {
+			StParker p;
+         if ((p = Interlocked.Exchange (ref state, DISPOSED)) == DISPOSED) {
+            return;
+         }
 
-            callback (state);
-            return new CancellationTokenRegistration (null, null);
-        }
+			while (p != NOT_CANCELLED) 
+			{
+				StParker pkn = p.pnext;
+				p.pnext = null;
+				p = pkn;
+			}
 
-        private static readonly Action<object> linkedCancel =
-            arg => ((CancellationTokenSource) arg).Cancel (false);
+         /*
+          * If this is a linked cancellation token source, unregister all callbacks
+			 * that we added to the linked tokens.
+          */
 
-        public static CancellationTokenSource CreateLinkedTokenSource (CancellationToken token1,
-                                                                       CancellationToken token2)
-        {
-            var lcts = new CancellationTokenSource ();
-            if (token1.CanBeCanceled) {
-                lcts.ctrList = new List<CancellationTokenRegistration>
-                {
-                    token1.InternalRegister (linkedCancel, lcts)
-                };
+         if (ctrList != null) {
+            foreach (CancellationTokenRegistration ctr in ctrList) {
+               ctr.Dispose ();
             }
+            ctrList = null;
+         }
+      }
 
-            if (token2.CanBeCanceled) {
-                if (lcts.ctrList == null) {
-                    lcts.ctrList = new List<CancellationTokenRegistration> ();
-                }
-                lcts.ctrList.Add (token2.InternalRegister (linkedCancel, lcts));
-            }
-
-            return lcts;
-        }
-
-        public static CancellationTokenSource CreateLinkedTokenSource (
-            params CancellationToken[] tokens)
-        {
-            if (tokens == null) {
-                throw new ArgumentNullException ("tokens");
-            }
-
-            if (tokens.Length == 0) {
-                throw new ArgumentException ("Cancellation tokens array is empty");
-            }
-
-            var lcts = new CancellationTokenSource ();
-
-            for (int i = 0; i < tokens.Length; i++) {
-                if (!tokens[i].CanBeCanceled) {
-                    continue;
-                }
-
-                if (lcts.ctrList == null) {
-                    lcts.ctrList = new List<CancellationTokenRegistration> ();
-                }
-
-                lcts.ctrList.Add (tokens[i].InternalRegister (linkedCancel, lcts));
-            }
-            return lcts;
-        }
-
-        public void Dispose ()
-        {
-            if (Interlocked.Exchange (ref state, DISPOSED) == DISPOSED) {
-                return;
-            }
-
-            //
-            // If this is a linked cancellation token source, unregister all cancel
-            // handlers from the sources with which it is linked.
-            //
-
-            if (ctrList != null) {
-                foreach (CancellationTokenRegistration ctr in ctrList) {
-                    ctr.Dispose ();
-                }
-                ctrList = null;
-            }
-        }
-
-        internal void UnlinkCancelHandler (CancelHandler tch)
-        {
-            if (state == tch &&
-                Interlocked.CompareExchange (ref state, tch.next, tch) == tch) {
-                return;
-            }
-
-            CancelHandler ch;
-            if ((ch = state) == CANCELLED || ch == null) {
-                return;
-            }
-
-            CancelHandler past;
-            if ((past = tch.next) != null && past.state != 0) {
-                past = past.next;
-            }
-
-            while (ch != null && ch != past) {
-                CancelHandler chn = ch.next;
-                if (chn != null && chn.state != 0) {
-                    Interlocked.CompareExchange (ref ch.next, chn.next, chn);
-                }
-                else {
-                    ch = chn;
-                }
-            }
-        }
-
-        private void ThrowIfDisposed ()
-        {
-            if (state == DISPOSED) {
-                throw new ObjectDisposedException ("CancellationTokenSource");
-            }
-        }
-    }
+      internal void ThrowIfDisposed ()
+      {
+         if (state == DISPOSED) {
+            throw new ObjectDisposedException ("CancellationTokenSource");
+         }
+      }
+   }
 }
 
 #endif

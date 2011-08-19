@@ -18,632 +18,607 @@
 // Author: Duarte Nunes (duarte.m.nunes@gmail.com)
 //
 
+using Microsoft.Win32.SafeHandles;
+
 #pragma warning disable 0420
 
 namespace System.Threading
 {
-    internal abstract class StWaitable
-    {
-        //
-        // Seed used to generate identifiers that don't need to be strictly
-        // unique, and the identifier shared by all notification events.
-        //
-
-        private static int idSeed = Int32.MinValue;
-        internal const int NOTIFICATION_EVENT_ID = Int32.MaxValue;
-
-        //
-        // The synchronizer ID is used to sort the synchronizers
-        // in the WaitAll method in order to prevent livelock.
-        //
-
-        internal volatile int id;
-
-        //
-        // Returns the "unique" waitable identifier.
-        //
-
-        private int Id
-        {
-            get
-            {
-                if (id == 0) {
-                    int nid;
-                    while ((nid = Interlocked.Increment (ref idSeed)) == 0 ||
-                           nid == NOTIFICATION_EVENT_ID) {
-                        ;
-                    }
-                    Interlocked.CompareExchange (ref id, nid, 0);
-                }
-                return id;
-            }
-        }
-
-        //
-        // Returns true if the waitable's state allows an immediate acquire.
-        //
-
-        internal abstract bool _AllowsAcquire { get; }
-
-        //
-        // Tries the waitable acquire operation.
-        //
-
-        internal abstract bool _TryAcquire ();
-
-        //
-        // Executes the release semantics associated with the Signal operation.
-        //
-
-        internal virtual bool _Release ()
-        {
-            return false;
-        }
-
-        //
-        // Executes the prologue for the WaitAny method.
-        //
-
-        internal abstract StWaitBlock _WaitAnyPrologue (StParker pk, int key,
-                                                        ref StWaitBlock hint, ref int sc);
-
-        //
-        // Executes the prologue for the WaitAll method.
-        //
-
-        internal abstract StWaitBlock _WaitAllPrologue (StParker pk,
-                                                        ref StWaitBlock hint, ref int sc);
-
-        //
-        // Excutes the epilogue for WaitOne and WaitAny methods.
-        //
-
-        internal virtual void _WaitEpilogue ()
-        {}
-
-        //
-        // Undoes a previous acquire operation.
-        //
-
-        internal virtual void _UndoAcquire ()
-        {}
-
-        //
-        // Cancels an acquire attempt.
-        //
-
-        internal abstract void _CancelAcquire (StWaitBlock wb, StWaitBlock hint);
-
-        //
-        // Waits until the synchronizer allows the acquire, activating
-        // the specified cancellers.
-        //
-
-        internal bool WaitOne (StCancelArgs cargs)
-        {
-            //
-            // Try to acquire and, if succeed, return success.
-            //
-
-            if (_TryAcquire ()) {
-                return true;
-            }
-
-            //
-            // Return failure, if a null timeout was specified.
-            //
-
-            if (cargs.Timeout == 0) {
-                return false;
-            }
-
-            //
-            // Create a parker and execute the WaitAny prologue.
-            //
-
-            var pk = new StParker ();
-            StWaitBlock hint = null;
-            int sc = 0;
-            StWaitBlock wb;
-            if ((wb = _WaitAnyPrologue (pk, StParkStatus.Success, ref hint, ref sc)) == null) {
-                return true;
-            }
-
-            //
-            // Park the current thread, activating the specified cancellers
-            // and spinning if appropriate.
-            //
-
-            int ws = pk.Park (sc, cargs);
-
-            //
-            // If the acquire succeed; so, execute the Wait epilogue
-            // and return success.
-            //
-
-            if (ws == StParkStatus.Success) {
-                _WaitEpilogue ();
-                return true;
-            }
-
-            //
-            // The acquire was cancelled; so, cancel the acquire attempt
-            // and report the failure appropriately.
-            //
-
-            _CancelAcquire (wb, hint);
-            StCancelArgs.ThrowIfException (ws);
-            return false;
-        }
-
-        //
-        // Waits unconditionally until the waitable allows the acquire.
-        //
-
-        internal void WaitOne()
-        {
-            WaitOne (StCancelArgs.None);
-        }
-
-        /// <summary>
-        /// Waits until one of the specified waitables allows the acquire,
-        /// activating the specified cancellers. 
-        /// </summary>
-        /// <param name="ws">The array of Waitables.</param>
-        /// <param name="cargs">The cancellation arguments.</param>
-        /// <returns></returns>
-        internal static int WaitAny(StWaitable[] ws, StCancelArgs cargs)
-        {
-            //
-            // Validate the parameters.
-            //
-            // NOTE: We support null references on the *ws* array, provided
-            //		 that the array contains at least a non-null entry.
-            //
-
-            int len = ws.Length;
-            int def = 0;
-
-            //
-            // First, we scan the *ws* array trying to acquire one of the
-            // synchronizers and computing the number of specified waitables.
-            //
-
-            for (int i = 0; i < len; i++) {
-                StWaitable w = ws[i];
-                if (w != null) {
-                    if (w._TryAcquire ()) {
-                        //
-                        // The acquire succedd, so return success.
-                        //
-
-                        return (StParkStatus.Success + i);
-                    }
-                    def++;
-                }
-            }
-
-            //
-            // If the *ws* array doesn't contain non-null references,
-            // throw ArgumentOutOfRangeException.
-            //
-
-            if (def == 0) {
-                throw new ArgumentOutOfRangeException ("ws: array is empty");
-            }
-
-            //
-            // Return failure, if a null timeout was specified.
-            //
-
-            if (cargs.Timeout == 0) {
-                return StParkStatus.Timeout;
-            }
-
-            //
-            // Create a parker and execute the WaitAny prologue on all
-            // waitables. We stop executing prologues as soon as we detect
-            // that the acquire operation was accomplished.
-            // 
-
-            StParker pk = new StParker (1);
-            StWaitBlock[] wbs = new StWaitBlock[len];
-            StWaitBlock[] hints = new StWaitBlock[len];
-            int lv = -1;
-            int sc = 0;
-            int gsc = 0;
-            for (int i = 0; !pk.IsLocked && i < len; i++) {
-                StWaitable w = ws[i];
-                if (w != null) {
-                    if ((wbs[i] = w._WaitAnyPrologue (pk, i, ref hints[i], ref sc)) == null) {
-                        break;
-                    }
-
-                    //
-                    // Adjust the global spin count.
-                    //
-
-                    if (gsc < sc) {
-                        gsc = sc;
-                    }
-                    lv = i;
-                }
-            }
-
-            //
-            // Park the current thread, activating the specified cancellers
-            // and spinning if appropriate.
-            //
-
-            int wst = pk.Park (gsc, cargs);
-
-            //
-            // Compute the acquired waitable, if any.
-            //
-
-            StWaitable acq = (wst >= StParkStatus.Success && wst < len) ? ws[wst] : null;
-
-            //
-            // Cancel the acquire attempt on all waitables where we
-            // executed the WaitAny prologue, except the one where the
-            // acquire was satisfied.
-            //
-
-            for (int i = 0; i <= lv; i++) {
-                StWaitable w = ws[i];
-                if (w != null && w != acq) {
-                    w._CancelAcquire (wbs[i], hints[i]);
-                }
-            }
-
-            //
-            // If the WaitAny succeed, execute the wait epilogue and
-            // return success.
-            //
-
-            if (acq != null) {
-                acq._WaitEpilogue ();
-                return wst;
-            }
-
-            //
-            // The WaitAny failed, so report the failure appropriately.
-            //
-
-            StCancelArgs.ThrowIfException (wst);
-            return StParkStatus.Timeout;
-        }
-
-        //
-        // Waits unconditionally until one of the specified waitables
-        // allows the acquire.
-        //
-
-        internal static int WaitAny(StWaitable[] ws)
-        {
-            return WaitAny (ws, StCancelArgs.None);
-        }
-
-        //
-        // Sorts the waitable array by the waitable id and, at the same time,
-        // check if all waitables allow an immediate acquire operation.
-        //
-        // NOTE: The notification events are not sorted, because they don't
-        //       have acquire side-effect. The notification events are grouped
-        //       at the end of the sorted array.
-        //
-
-        internal static int SortAndCheckAllowAcquire(StWaitable[] ws, StWaitable[] sws)
-        {
-            int i, jj;
-            StWaitable w;
-            bool acqAll = true;
-            int len = ws.Length;
-
-            //
-            // Find the first waitable that isn't a notification event,
-            // in order to start insertion sort.
-            //
-
-            jj = len;
-            for (i = 0; i < len; i++) {
-                w = ws[i];
-                acqAll &= w._AllowsAcquire;
-
-                //
-                // If the current waitable is a notification event, insert
-                // it at the end of the ordered array; otherwise, insert it
-                // on the begin of the array and break the loop.
-                //
-
-                if (w.id == NOTIFICATION_EVENT_ID) {
-                    sws[--jj] = w;
-                }
-                else {
-                    sws[0] = w;
-                    break;
-                }
-            }
-
-            //
-            // If all synchronizers are notification events, return.
-            //
-
-            if (i == len) {
-                return acqAll ? 1 : 0;
-            }
-
-            //
-            // Sort the remaining synchronizers using the insertion sort
-            // algorithm but only with the non-notification event waitables.
-            //
-
-            int k = 1;
-            for (i++; i < len; i++, k++) {
-                w = ws[i];
-                acqAll &= w._AllowsAcquire;
-                if (w.id == NOTIFICATION_EVENT_ID) {
-                    sws[--jj] = w;
-                }
-                else {
-                    //
-                    // Find the insertion position for *w*.
-                    //
-
-                    sws[k] = w;
-                    int j = k - 1;
-                    while (j >= 0 && sws[j].Id > w.Id) {
-                        sws[j + 1] = sws[j];
-                        j--;
-                    }
-
-                    //
-                    // Insert at j+1 position.
-                    //
-
-                    sws[j + 1] = w;
-
-                    //
-                    // Check for duplicates.
-                    //
-
-                    if (sws[k - 1] == sws[k]) {
-                        return -1;
-                    }
-                }
-            }
-            return acqAll ? 1 : 0;
-        }
-
-        /// <summary>
-        /// Waits until all the specified waitable allow the acquire, activating the
-        /// specified cancellers.
-        /// </summary>
-        /// <param name="ws"></param>
-        /// <param name="cargs"></param>
-        /// <returns></returns>
-        internal static bool WaitAll(StWaitable[] ws, StCancelArgs cargs)
-        {
-            int len = ws.Length;
-            StWaitable[] sws = new StWaitable[len];
-
-            int waitHint = SortAndCheckAllowAcquire (ws, sws);
-
-            //
-            // If there are duplicates, throw ArgumentException.
-            //
-
-            if (waitHint < 0) {
-                throw new ArgumentException ("ws: contains duplicates");
-            }
-
-            //
-            // Return failure if the WaitAll can't be satisfied immediately
-            // and a null timeout was specified.
-            //
-
-            if (waitHint == 0 && cargs.Timeout == 0) {
-                return false;
-            }
-
-            //
-            // If a timeout was specified, get the current time in order
-            // to adjust the timeout value later, if we re-wait.
-            //
-
-            int lastTime = (cargs.Timeout != Timeout.Infinite) ? Environment.TickCount : 0;
-            StWaitBlock[] wbs = null;
-            StWaitBlock[] hints = null;
-            do {
-                if (waitHint == 0) {
-                    //
-                    // Create the wait block arrays if this is the first time
-                    // that we execute the acquire-all prologue.
-                    //
-
-                    if (wbs == null) {
-                        wbs = new StWaitBlock[len];
-                        hints = new StWaitBlock[len];
-                    }
-
-                    //
-                    // Create a parker for cooperative release, specifying
-                    // as many releasers as the number of waitables.
-                    //
-                    // NOTE: The wait blocks and the parker can't be reused.
-                    //
-
-                    StParker pk = new StParker (len);
-
-                    //
-                    // Execute the WaitAll prologue on all waitables.
-                    //
-
-                    int gsc = 1;
-                    int sc = 0;
-                    for (int i = 0; i < len; i++) {
-                        if ((wbs[i] = sws[i]._WaitAllPrologue (pk, ref hints[i], ref sc)) != null) {
-                            //
-                            // Adjust the global spin count.
-                            //
-
-                            if (gsc != 0) {
-                                if (sc == 0) {
-                                    gsc = 0;
-                                }
-                                else if (sc > gsc) {
-                                    gsc = sc;
-                                }
-                            }
-                        }
-                    }
-
-                    int wst = pk.Park (gsc, cargs);
-
-                    //
-                    // If the wait was cancelled due to timeout, alert or interrupt,
-                    // cancel the acquire attempt on all waitables where we actually
-                    // inserted wait blocks.
-                    //
-
-                    if (wst != StParkStatus.StateChange) {
-                        for (int i = 0; i < len; i++) {
-                            StWaitBlock wb = wbs[i];
-                            if (wb != null) {
-                                sws[i]._CancelAcquire (wb, hints[i]);
-                            }
-                        }
-
-                        StCancelArgs.ThrowIfException (wst);
-                        return false;
-                    }
-                }
-
-                //
-                // All waitables where we inserted wait blocks seem to
-                // allow an immediate acquire operation; so, try to acquire
-                // all them.
-                //
-
-                int idx;
-                for (idx = 0; idx < len; idx++) {
-                    if (!sws[idx]._TryAcquire ()) {
-                        break;
-                    }
-                }
-
-                //
-                // If all synchronizers were acquired, return success.
-                //
-
-                if (idx == len) {
-                    return true;
-                }
-
-                //
-                // We failed to acquire all waitables, so undo the acquires
-                // that we did above.
-                //
-
-                while (--idx >= 0) {
-                    sws[idx]._UndoAcquire ();
-                }
-
-                //
-                // If a timeout was specified, adjust the timeout value
-                // that will be used on the next wait.
-                //
-
-                if (!cargs.AdjustTimeout (ref lastTime)) {
-                    return false;
-                }
-
-                waitHint = 0;
-            }
-            while (true);
-        }
-
-        //
-        // Wait unconditionally until all the specified waitables
-        // allow the acquire.
-        //
-
-        internal static void WaitAll(StWaitable[] ws)
-        {
-            WaitAll (ws, StCancelArgs.None);
-        }
-
-        //
-        // Signals a waitable and waits on another as an atomic
-        // operation, activating the specified cancellers.
-        //
-
-        internal static bool SignalAndWait(StWaitable tos, StWaitable tow, StCancelArgs cargs)
-        {
-            //
-            // Create a parker to execute the WaitAny prologue on the
-            // *tow* waitable.
-            //
-
-            StParker pk = new StParker ();
-            StWaitBlock hint = null;
-            int sc = 0;
-            StWaitBlock wb = tow._WaitAnyPrologue (pk, StParkStatus.Success, ref hint, ref sc);
-
-            //
-            // Signal the *tos* waitable.
-            //
-
-            if (!tos._Release ()) {
-                //
-                // The signal operation failed. So, try to cancel the parker and,
-                // if successful, cancel the acquire attempt; otherwise, wait until 
-                // the thread is unparked and, then, undo the acquire.
-                //
-
-                if (pk.TryCancel ()) {
-                    tow._CancelAcquire (wb, hint);
-                }
-                else {
-                    pk.Park ();
-                    tow._UndoAcquire ();
-                }
-            }
-
-            //
-            // Park the current thread, activating the specified cancellers
-            // and spinning if appropriate.
-            //
-
-            int ws = pk.Park (sc, cargs);
-
-            //
-            // If we acquired, execute the Wait epilogue and return success.
-            //
-
-            if (ws == StParkStatus.Success) {
-                tow._WaitEpilogue ();
-                return true;
-            }
-
-            //
-            // The acquire operation was cancelled; so, cancel the acquire
-            // attempt and report the failure appropriately.
-            //
-
-            tow._CancelAcquire (wb, hint);
-            StCancelArgs.ThrowIfException (ws);
-            return false;
-        }
-
-        //
-        // Signals a waitable and waits unconditionally on another
-        // as an atomic operation.
-        //
-
-        internal static void SignalAndWait(StWaitable tos, StWaitable tow)
-        {
-            SignalAndWait (tos, tow, StCancelArgs.None);
-        }
-    }
+	public abstract class StWaitable
+	{
+		internal static readonly StWaitBlock INFLATED = new StWaitBlock ();
+		private static int idSeed = Int32.MinValue;
+		internal const int NOTIFICATION_EVENT_ID = Int32.MaxValue;
+
+		/*
+       * The synchronizer ID is used to sort the synchronizers
+       * in the WaitAll method in order to prevent livelock.
+       */
+
+		internal volatile int id;
+		internal SafeWaitHandle swhandle;
+
+		private int Id {
+			get 
+			{
+				if (id == 0) {
+					int nid;
+					while ((nid = Interlocked.Increment (ref idSeed)) == 0 ||
+					       nid == NOTIFICATION_EVENT_ID) { }
+					Interlocked.CompareExchange (ref id, nid, 0);
+				}
+				return id;
+			}
+		}
+
+		/*
+       * The Waitable virtual methods.
+       */
+
+		internal abstract bool _AllowsAcquire { get; }
+
+		internal abstract bool _TryAcquire ();
+
+		internal virtual bool _Release ()
+		{
+			return false;
+		}
+
+		internal virtual StWaitBlock _Inflate () {
+			throw new InvalidOperationException ();
+		}
+
+		internal virtual IntPtr _CreateNativeObject () {
+			throw new InvalidOperationException ();
+		}
+
+		internal abstract StWaitBlock _WaitAnyPrologue (StParker pk, int key,
+		                                                ref StWaitBlock hint, ref int sc);
+
+		internal abstract StWaitBlock _WaitAllPrologue (StParker pk,
+		                                                ref StWaitBlock hint, ref int sc);
+
+		internal virtual void _WaitEpilogue () { }
+
+		internal virtual void _UndoAcquire () { }
+
+		internal virtual void _UndoInflatedAcquire () { }
+
+		internal abstract void _CancelAcquire (StWaitBlock wb, StWaitBlock hint);
+
+		internal virtual Exception _SignalException {
+			get { return new InvalidOperationException (); }
+		}
+
+		/*
+		 * The inflate methods execute within a CER.
+		 */
+ 
+		internal void Inflate ()
+		{
+			Inflate (new SafeWaitHandle (_CreateNativeObject (), true));
+		}
+
+		internal void Inflate (SafeWaitHandle swh)
+		{
+			swhandle = swh;
+
+			StWaitBlock wb = _Inflate ();
+
+			while (wb != null) {
+				if (wb.parker.TryCancel ()) {
+					wb.parker.Unpark (StParkStatus.Inflated);
+				}
+				wb = wb.next;
+			}
+		}
+
+		internal bool TryWaitOne (StCancelArgs cargs)
+		{
+			if (_TryAcquire ()) {
+				return true;
+			}
+
+			if (cargs.Timeout == 0) {
+				return false;
+			}
+
+			var pk = new StParker ();
+			StWaitBlock hint = null;
+			int sc = 0;
+			StWaitBlock wb;
+			if ((wb = _WaitAnyPrologue (pk, StParkStatus.Success, ref hint, ref sc)) == null) {
+				return hint != INFLATED || InflatedWait (cargs);
+			}
+
+			int ws = pk.Park (sc, cargs);
+
+			if (ws == StParkStatus.Success) {
+				_WaitEpilogue ();
+				return true;
+			}
+
+			if (ws == StParkStatus.Inflated) {
+				return InflatedWait (cargs);
+			}
+
+			_CancelAcquire (wb, hint);
+			cargs.ThrowIfException (ws);
+			return false;
+		}
+
+		internal bool TryWaitOne ()
+		{
+			return _TryAcquire ();
+		}
+
+		internal void WaitOne ()
+		{
+			TryWaitOne (StCancelArgs.None);
+		}
+
+		internal bool InflatedWait (StCancelArgs cargs) 
+		{
+			/*
+			 * Waits coming from a ManualResetEventSlim are cancellable.
+			 */
+#if NET_4_0 || MOBILE
+			using (cargs.CancellationToken.RegisterInternal (t => ((Thread)t).Interrupt (), 
+																			 Thread.CurrentThread)) 
+#endif
+			{
+				bool release = false;
+				try {
+					swhandle.DangerousAddRef (ref release);
+					return StInternalMethods.Wait_internal (swhandle.DangerousGetHandle (), cargs.Timeout);
+#if NET_4_0 || MOBILE
+				} catch (ThreadInterruptedException) {
+					cargs.ThrowIfException (cargs.CancellationToken.IsCancellationRequested 
+						                     ? StParkStatus.Cancelled
+													: StParkStatus.Interrupted);
+					return false;
+#endif
+				} finally {
+					if (release) {
+						swhandle.DangerousRelease ();
+					}
+				}
+			}
+		}
+
+		private static int InflatedWaitMultiple (StWaitable[] ws, bool waitAll, int inflatedIndexes,
+															  int inflatedCount, StCancelArgs cargs)
+		{
+			var handles = new SafeWaitHandle [inflatedCount];
+			var refs = new bool [inflatedCount];
+#if NET_4_0 || MOBILE
+			var reg = default (CancellationTokenRegistration);
+#endif
+
+			try {
+				for (int i = 0, handleIdx = 0; i < ws.Length; ++i) {
+					if ((inflatedIndexes & (1 << i)) != 0) {
+						var swhandle = ws [i].swhandle;
+						swhandle.DangerousAddRef (ref refs [handleIdx]);
+						handles [handleIdx++] = swhandle;
+					}
+				}
+
+#if NET_4_0 || MOBILE
+				reg = cargs.CancellationToken.RegisterInternal (t => ((Thread) t).Interrupt (),
+				                                                Thread.CurrentThread);
+#endif
+				int res = StInternalMethods.WaitMultiple_internal (IntPtr.Zero, handles, waitAll,
+				                                                   cargs.Timeout);
+				return res == WaitHandle.WaitTimeout ? StParkStatus.Success : StParkStatus.Timeout;
+#if NET_4_0 || MOBILE
+			} catch (ThreadInterruptedException) {
+				return cargs.CancellationToken.IsCancellationRequested 
+					  ? StParkStatus.Cancelled 
+					  : StParkStatus.Interrupted;
+#endif
+			} finally {
+				for (int i = 0; i < handles.Length; ++i) {
+					if (refs [i]) {
+						handles [i].DangerousRelease ();
+					}
+				}
+#if NET_4_0 || MOBILE
+				reg.Dispose ();
+#endif
+			}
+		}
+
+		internal static int WaitAny (StWaitable[] ws)
+		{
+			return WaitAny (ws, StCancelArgs.None);
+		}
+
+		internal static int WaitAny (StWaitable[] ws, StCancelArgs cargs)
+		{
+			if (ws == null) {
+				throw new ArgumentNullException ("ws");
+			}
+
+			int len = ws.Length;
+
+			for (int i = 0; i < len; i++) {
+				if (ws [i]._TryAcquire ()) {
+					return StParkStatus.Success + i;
+				}
+			}
+
+			if (cargs.Timeout == 0) {
+				return StParkStatus.Timeout;
+			}
+
+		retry:
+
+			/*
+			 * Create a parker and execute the WaitAny prologue on all
+			 * waitables. We stop executing prologues as soon as we detect
+			 * that the acquire operation was accomplished.
+			 */ 
+
+			var pk = new StParker (1);
+			int inflated = 0;
+			int inflatedCount = 0;
+			var wbs = new StWaitBlock [len];
+			var hints = new StWaitBlock [len];
+
+			int lv = -1;
+			int gsc = 0;
+
+			for (int i = 0; !pk.IsLocked && i < len; i++) {
+				StWaitable w = ws [i];
+				int sc = 0;
+
+				if ((wbs [i] = w._WaitAnyPrologue (pk, i, ref hints [i], ref sc)) == null) {
+					if (hints [i] == INFLATED) {
+						inflated |= 1 << i;
+						inflatedCount += 1;
+					} else {
+						if (pk.TryLock ()) {
+							pk.UnparkSelf (i);
+						} else {
+							w._UndoAcquire ();
+						}
+						break;
+					}
+				} else if (gsc < sc) {
+					gsc = sc;
+				}
+				lv = i;
+			}
+
+			int wst = inflatedCount == len ? InflatedWaitMultiple (ws, false, inflated, inflatedCount, cargs)
+					  : inflatedCount > 0 ? pk.Park (gsc, ws, inflated, inflatedCount, cargs)
+					  : pk.Park (gsc, cargs);
+			 
+			StWaitable acq = wst >= StParkStatus.Success ? ws [wst] : null;
+
+			/*
+			 * Cancel the acquire attempt on all waitables where we executed the WaitAny
+			 * prologue, except the one we acquired and the ones that are inflated.
+			 */
+
+			for (int i = 0; i <= lv; i++) {
+				StWaitable w = ws [i];
+				StWaitBlock wb = wbs [i];
+				if (w != acq && wb != null) {
+					w._CancelAcquire (wb, hints [i]);
+				}
+			}
+
+			if (acq != null) {
+				try {
+					acq._WaitEpilogue ();
+				} catch (AbandonedMutexException e) {
+					e.MutexIndex = wst;
+					throw;
+				}
+				return wst;
+			}
+
+			if (wst == StParkStatus.Inflated) {
+				goto retry;
+			}
+
+			cargs.ThrowIfException (wst);
+			return StParkStatus.Timeout;
+		}
+
+		/*
+		 * Sorts the waitable array by the waitable id and, at the same time,
+		 * check if all waitables allow an immediate acquire operation.
+		 *
+		 * NOTE: The notification events are not sorted, because they don't
+		 *       have an acquire side-effect. The notification events are 
+		 *       grouped at the end of the sorted array.
+		 */
+
+		private static int SortAndCheckAllowAcquire (StWaitable[] ws, StWaitable[] sws, out int nevts)
+		{
+			int i;
+			StWaitable w;
+			bool acqAll = true;
+			int len = ws.Length;
+
+			/*
+			 * Find the first waitable that isn't a notification event,
+			 * in order to start insertion sort.			 
+			 */
+
+			nevts = len;
+			for (i = 0; i < len; i++) {
+				w = ws [i];
+				acqAll &= w._AllowsAcquire;
+
+				/*
+				 * If the current waitable is a notification event, insert
+				 * it at the end of the ordered array; otherwise, insert it
+				 * at the begin of the array and break the loop.
+				 */
+
+				if (w.id == NOTIFICATION_EVENT_ID) {
+					sws [--nevts] = w;
+				} else {
+					sws [0] = w;
+					break;
+				}
+			}
+
+			/*
+			 * If all synchronizers are notification events, return.
+			 */
+
+			if (nevts == 0) {
+				return acqAll ? 1 : 0;
+			}
+
+			/*
+			 * Sort the remaining synchronizers using the insertion sort
+			 * algorithm but only with the non-notification event waitables.
+			 */
+
+			int k = 1;
+			for (i++; i < len; i++, k++) {
+				w = ws [i];
+				acqAll &= w._AllowsAcquire;
+				if (w.id == NOTIFICATION_EVENT_ID) {
+					sws [--nevts] = w;
+				} else {
+					sws [k] = w;
+					int j = k - 1;
+					while (j >= 0 && sws [j].Id > w.Id) {
+						sws [j + 1] = sws [j];
+						j--;
+					}
+
+					sws [j + 1] = w;
+
+					if (sws [k - 1] == sws [k]) {
+						return -1;
+					}
+				}
+			}
+			return acqAll ? 1 : 0;
+		}
+
+		internal static bool WaitAll (StWaitable[] ws, StCancelArgs cargs)
+		{
+			if (ws == null) {
+				throw new ArgumentNullException ("ws");
+			}
+
+			int nevts;
+			int len = ws.Length;
+			var sws = new StWaitable [len];
+
+			int waitHint = SortAndCheckAllowAcquire (ws, sws, out nevts);
+
+			if (waitHint < 0) {
+				throw new DuplicateWaitObjectException ();
+			}
+
+			/*
+			 * Return success if all synchronizers are notification events and are set.
+			 */
+
+			if (waitHint != 0) {
+				if (nevts == 0) {
+					return true;
+				}
+			} else if (cargs.Timeout == 0) {
+				return false;
+			}
+
+			/*
+			 * If a timeout was specified, get the current time in order
+			 * to adjust the timeout value later, if we re-wait.
+			 */
+
+			int lastTime = (cargs.Timeout != Timeout.Infinite) ? Environment.TickCount : 0;
+			StWaitBlock[] wbs = null;
+			StWaitBlock[] hints = null;
+			do {
+				int inflated = 0;
+				AbandonedMutexException ame = null;
+
+				if (waitHint == 0) {
+
+					if (wbs == null) {
+						wbs = new StWaitBlock [len];
+						hints = new StWaitBlock [len];
+					}
+
+					/*
+					 * Create a parker for cooperative release, specifying as many
+					 * releasers as the number of waitables. The parker is not reused
+					 * because other threads may have references to it.
+					 */
+
+					var pk = new StParker (len);
+					int inflatedCount = 0;
+
+					int gsc = 1;
+					int sc = 0;
+					for (int i = 0; i < len; i++) {
+						if ((wbs [i] = sws [i]._WaitAllPrologue (pk, ref hints [i], ref sc)) == null) {
+							if (hints [i] == INFLATED) {
+								inflated |= 1 << i;
+								inflatedCount += 1;
+							} else if (pk.TryLock ()) {
+								pk.UnparkSelf (StParkStatus.StateChange);
+							}
+						} else if (gsc != 0) {
+							if (sc == 0) {
+								gsc = 0;
+							} else if (sc > gsc) {
+								gsc = sc;
+							}
+						}
+					}
+
+					if (inflatedCount > 0 && pk.TryLock (inflatedCount)) {
+						pk.UnparkSelf (StParkStatus.StateChange);
+					}
+					
+					int wst = pk.Park (gsc, cargs);
+
+					/*
+					 * We opt for a less efficient but simpler implementation instead
+					 * of using the same approach as the WaitAny operation, because:
+					 *  - When parking, the thread would have to call into the park spot
+					 *    even if it was already unparked, since we have to wait for the
+					 *    other handles as well;
+					 *  - We would have to deal with cancellation in a different way,
+					 *    relying on interrupts instead of the TryCancel/Unpark pair;
+					 *  - The Unpark operation might not wake the target thread, which
+					 *    could lead to bugs.
+					 */ 
+
+					if (wst == StParkStatus.StateChange && inflatedCount > 0) {
+						if (!cargs.AdjustTimeout (ref lastTime)) {
+							return false;
+						}
+						wst = InflatedWaitMultiple (ws, true, inflated, inflatedCount, cargs);
+					}
+				
+					if (wst != StParkStatus.StateChange) {
+						for (int i = 0; i < len; i++) {
+							StWaitBlock wb = wbs [i];
+							if (wb != null) {
+								sws [i]._CancelAcquire (wb, hints [i]);
+							}
+						}
+
+						if (wst == StParkStatus.Inflated) {
+							waitHint = 0;
+							continue;
+						}
+
+						cargs.ThrowIfException (wst);
+						return false;
+					}
+				}
+
+				/*
+				 * All waitables where we inserted wait blocks seem to allow an 
+				 * immediate acquire operation; so, try to acquire all non-inflated
+				 * waitables that are not notification events.
+				 */
+
+				int idx;
+				for (idx = 0; idx < nevts; idx++) {
+					try {
+						if ((inflated & (1 << idx)) == 0 && !sws[idx]._TryAcquire()) {
+							break;
+						}
+					} catch (AbandonedMutexException e) {
+						ame = e;
+						ame.MutexIndex = idx;
+					}
+				}
+
+				if (idx == nevts) {
+					if (ame != null) {
+						throw ame;
+					}
+					return true;
+				}
+
+				/*
+				 * We failed to acquire all waitables, so undo the acquires
+				 * that we did above.
+				 */
+
+				for (int i = idx + 1; i < nevts; ++i) {
+					if ((inflated & (1 << idx)) != 0) {
+						sws[i]._UndoAcquire ();	
+					}
+				}
+
+				while (--idx >= 0) {
+					sws[idx]._UndoAcquire ();
+				}
+				
+				if (!cargs.AdjustTimeout (ref lastTime)) {
+					return false;
+				}
+
+				waitHint = 0;
+			} while (true);
+		}
+
+		internal static void WaitAll (StWaitable[] ws)
+		{
+			WaitAll (ws, StCancelArgs.None);
+		}
+
+		internal static bool SignalAndWait (StWaitable tos, StWaitable tow, StCancelArgs cargs)
+		{
+			if (tos == tow) {
+				return true;
+			}
+
+			var pk = new StParker ();
+			StWaitBlock hint = null;
+			int sc = 0;
+			StWaitBlock wb = tow._WaitAnyPrologue (pk, StParkStatus.Success, ref hint, ref sc);
+
+			if (!tos._Release ()) {
+				if (wb != null && pk.TryCancel ()) {
+               tow._CancelAcquire (wb, hint);
+            } else {
+					if (wb != null) { 
+						pk.Park ();
+					}
+					tow._UndoAcquire ();
+				}
+
+				throw tos._SignalException;
+			}
+
+			int ws;
+			
+			if (hint == INFLATED || (ws = pk.Park (sc, cargs)) == StParkStatus.Inflated) {
+				return tow.InflatedWait (cargs);
+			}
+
+			if (ws == StParkStatus.Success) {
+				tow._WaitEpilogue ();
+				return true;
+			}
+
+			tow._CancelAcquire (wb, hint);
+			cargs.ThrowIfException (ws);
+			return false;
+		}
+
+		internal static void SignalAndWait (StWaitable tos, StWaitable tow)
+		{
+			SignalAndWait (tos, tow, StCancelArgs.None);
+		}
+	}
 }

@@ -97,7 +97,13 @@ monoutils_sources = \
 	mono-threads.h	\
 	mono-tls.h	\
 	linux_magic.h	\
-	mono-memory-model.h
+	mono-memory-model.h	\
+	st.h	\
+	st-alerter.c \
+	st-ds.h	\
+	st-lock.c	\
+	st-parker.c	\
+	st-spinwait.c
 
 arch_sources = 
 
