@@ -376,7 +376,9 @@ BASE_TEST_CS_SRC=		\
 	bug-685908.cs	\
 	sgen-long-vtype.cs	\
 	delegate-invoke.cs	\
-	bug-696593.cs
+	bug-696593.cs	\
+	monitor-thin.cs	\
+	monitor-thin-stress.cs
 
 TEST_CS_SRC_DIST=	\
 	$(BASE_TEST_CS_SRC)	\
