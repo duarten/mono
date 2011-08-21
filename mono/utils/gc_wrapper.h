@@ -1,3 +1,7 @@
+/* 
+ * Copyright 2004-2011 Novell, Inc (http://www.novell.com)
+ * Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
+ */
 #ifndef __MONO_OS_GC_WRAPPER_H__
 #define __MONO_OS_GC_WRAPPER_H__
 
@@ -75,6 +79,7 @@
 int mono_gc_pthread_create (pthread_t *new_thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);
 int mono_gc_pthread_join (pthread_t thread, void **retval);
 int mono_gc_pthread_detach (pthread_t thread);
+void mono_gc_pthread_exit (void *retval) G_GNUC_NORETURN;
 
 #endif
 

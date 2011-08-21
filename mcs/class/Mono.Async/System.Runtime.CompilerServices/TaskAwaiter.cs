@@ -5,6 +5,7 @@
 //	Marek Safar  <marek.safar@gmail.com>
 //
 // Copyright (C) 2011 Novell, Inc (http://www.novell.com)
+// Copyright (C) 2011 Xamarin, Inc (http://www.xamarin.com)
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -26,6 +27,7 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace System.Runtime.CompilerServices
@@ -48,39 +50,28 @@ namespace System.Runtime.CompilerServices
 		public void GetResult ()
 		{
 			if (task.Status != TaskStatus.RanToCompletion)
-				throw new NotImplementedException ();
+				throw HandleUnexpectedTaskResult (task);
 		}
 
-		public void OnCompleted (Action continuation)
+		internal static Exception HandleUnexpectedTaskResult (Task task)
 		{
-			if (continuation == null)
-				throw new ArgumentNullException ("continuation");
-
-			task.ContinueWith (l => continuation (), TaskContinuationOptions.ExecuteSynchronously);
-		}
-	}
-
-	public struct TaskAwaiter<TResult>
-	{
-		readonly Task<TResult> task;
-
-		internal TaskAwaiter (Task<TResult> task)
-		{
-			this.task = task;
-		}
-
-		public bool IsCompleted {
-			get {
-				return task.IsCompleted;
+			switch (task.Status) {
+			case TaskStatus.Canceled:
+				return new TaskCanceledException (task);
+			case TaskStatus.Faulted:
+				return task.Exception.InnerException;
+			default:
+				return new InvalidOperationException ("The task has not finished yet");
 			}
 		}
 
-		public TResult GetResult ()
+		internal static void HandleOnCompleted (Task task, Action continuation)
 		{
-			if (task.Status != TaskStatus.RanToCompletion)
-				throw new NotImplementedException ();
-
-			return task.Result;
+			var scontext = SynchronizationContext.Current;
+			if (scontext != null)
+				task.ContinueWith (l => scontext.Post (cont => ((Action) cont) (), continuation), TaskContinuationOptions.ExecuteSynchronously);
+			else
+				task.ContinueWith (l => continuation (), TaskContinuationOptions.ExecuteSynchronously);
 		}
 
 		public void OnCompleted (Action continuation)
@@ -88,7 +79,7 @@ namespace System.Runtime.CompilerServices
 			if (continuation == null)
 				throw new ArgumentNullException ("continuation");
 
-			task.ContinueWith (l => continuation (), TaskContinuationOptions.ExecuteSynchronously);
+			HandleOnCompleted (task, continuation);
 		}
 	}
 }

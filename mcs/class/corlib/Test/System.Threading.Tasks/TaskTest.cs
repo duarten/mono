@@ -117,6 +117,15 @@ namespace MonoTests.System.Threading.Tasks
 			Assert.AreEqual (1, aggr.InnerExceptions.Count, "#4");
 			Assert.IsInstanceOfType (typeof (OperationCanceledException), aggr.InnerExceptions[0], "#5");
 		}
+
+		[Test, ExpectedException (typeof (InvalidOperationException))]
+		public void CreationWhileInitiallyCanceled ()
+		{
+			var token = new CancellationToken (true);
+			var task = new Task (() => { }, token);
+			Assert.AreEqual (TaskStatus.Canceled, task.Status);
+			task.Start ();
+		}
 		
 		[Test]
 		public void ContinueWithOnAnyTestCase()
@@ -275,6 +284,40 @@ namespace MonoTests.System.Threading.Tasks
 			t.RunSynchronously ();
 
 			Assert.AreEqual (1, val);
+		}
+
+		[Test]
+		public void UnobservedExceptionOnFinalizerThreadTest ()
+		{
+			bool wasCalled = false;
+			TaskScheduler.UnobservedTaskException += (o, args) => {
+				wasCalled = true;
+				args.SetObserved ();
+			};
+			var inner = new ApplicationException ();
+			Task.Factory.StartNew (() => { throw inner; });
+			Thread.Sleep (1000);
+			GC.Collect ();
+			Thread.Sleep (1000);
+			GC.WaitForPendingFinalizers ();
+
+			Assert.IsTrue (wasCalled);
+		}
+
+		[Test, ExpectedException (typeof (InvalidOperationException))]
+		public void StartFinishedTaskTest ()
+		{
+			var t = Task.Factory.StartNew (delegate () { });
+			t.Wait ();
+
+			t.Start ();
+		}
+
+		[Test, ExpectedException (typeof (InvalidOperationException))]
+		public void DisposeUnstartedTest ()
+		{
+			var t = new Task (() => { });
+			t.Dispose ();
 		}
 	}
 }

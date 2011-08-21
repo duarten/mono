@@ -287,5 +287,22 @@ namespace System.Xml.Serialization
 				
 			sb.Append ("|");
 		}
+
+		internal int? Order {
+			get {
+				int? order = null;
+				if (XmlElements.Count > 0)
+					order = XmlElements.Order;
+				else if (XmlArray != null)
+					order = XmlArray.Order;
+				else if (XmlAnyElements.Count > 0)
+					order = XmlAnyElements.Order;
+				return order;
+			}
+		}
+		
+		internal int SortableOrder {
+			get { return Order != null ? (int) Order : int.MinValue; }
+		}
 	}
 }

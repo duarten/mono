@@ -6,6 +6,8 @@
  *   Paolo Molaro (lupus@ximian.com)
  *
  * (C) 2002 Ximian, Inc.
+ * Copyright 2003-2011 Novell Inc (http://www.novell.com)
+ * Copyright 2011 Xamarin Inc (http://www.xamarin.com)
  */
 #include <config.h>
 #include <math.h>
@@ -1024,7 +1026,7 @@ mono_object_castclass (MonoObject *obj, MonoClass *klass)
 	MonoJitTlsData *jit_tls = NULL;
 
 	if (mini_get_debug_options ()->better_cast_details) {
-		jit_tls = TlsGetValue (mono_jit_tls_id);
+		jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 		jit_tls->class_cast_from = NULL;
 	}
 
@@ -1052,7 +1054,7 @@ mono_object_castclass_with_cache (MonoObject *obj, MonoClass *klass, gpointer *c
 	gpointer cached_vtable, obj_vtable;
 
 	if (mini_get_debug_options ()->better_cast_details) {
-		jit_tls = TlsGetValue (mono_jit_tls_id);
+		jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 		jit_tls->class_cast_from = NULL;
 	}
 

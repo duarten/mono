@@ -239,6 +239,8 @@ class MemberAccessData
 			return "alo";
 		}
 	}
+	
+	public object SetOnly { set { } }
 }
 
 enum MyEnum : byte
@@ -292,6 +294,8 @@ class Indexer
 	public string this [params string[] i] { get { return string.Concat (i); } }
 }
 
+class A { }
+class B : A { }
 
 // TODO: Add more nullable tests, follow AddTest pattern.
 
@@ -1752,6 +1756,14 @@ class Tester
 		Assert (0, r);
 	}	
 
+	void MemberInitTest_5 ()
+	{
+		Expression<Func<MemberAccessData>> e = () => new MemberAccessData { SetOnly = new object { } };
+
+		AssertNodeType (e, ExpressionType.MemberInit);
+		e.Compile () ();
+	}
+
 	void ModuloTest ()
 	{
 		Expression<Func<int, int, int>> e = (int a, int b) => a % b;
@@ -2687,6 +2699,13 @@ class Tester
 		Expression<Func<object, bool>> e3 = (object a) => null is object;
 		AssertNodeType (e3, ExpressionType.TypeIs);
 		Assert (false, e3.Compile ().Invoke (null));
+	}
+	
+	void TypeIsTest_4 ()
+	{
+		Expression<Func<B, bool>> e = l => l is A;
+		AssertNodeType (e, ExpressionType.TypeIs);
+		Assert (false, e.Compile ().Invoke (null));
 	}
 	
 	void TypeIsTest_5 ()

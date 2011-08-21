@@ -6,6 +6,7 @@
  *
  * Copyright 2002-2003 Ximian, Inc (http://www.ximian.com)
  * Copyright 2004-2009 Novell, Inc (http://www.novell.com)
+ * Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
  *
  */
 
@@ -35,6 +36,7 @@
 #include "mono/metadata/gc-internal.h"
 #include "mono/metadata/cominterop.h"
 #include "mono/utils/mono-counters.h"
+#include "mono/utils/mono-tls.h"
 #include <string.h>
 #include <errno.h>
 
@@ -76,9 +78,9 @@ typedef struct _MonoRemotingMethods MonoRemotingMethods;
 static CRITICAL_SECTION marshal_mutex;
 static gboolean marshal_mutex_initialized;
 
-static guint32 last_error_tls_id;
+static MonoNativeTlsKey last_error_tls_id;
 
-static guint32 load_type_info_tls_id;
+static MonoNativeTlsKey load_type_info_tls_id;
 
 static void
 delegate_hash_table_add (MonoDelegate *d);
@@ -201,8 +203,8 @@ mono_marshal_init (void)
 		module_initialized = TRUE;
 		InitializeCriticalSection (&marshal_mutex);
 		marshal_mutex_initialized = TRUE;
-		last_error_tls_id = TlsAlloc ();
-		load_type_info_tls_id = TlsAlloc ();
+		mono_native_tls_alloc (&last_error_tls_id, NULL);
+		mono_native_tls_alloc (&load_type_info_tls_id, NULL);
 
 		register_icall (ves_icall_System_Threading_Thread_ResetAbort, "ves_icall_System_Threading_Thread_ResetAbort", "void", TRUE);
 		register_icall (mono_marshal_string_to_utf16, "mono_marshal_string_to_utf16", "ptr obj", FALSE);
@@ -263,8 +265,8 @@ mono_marshal_cleanup (void)
 {
 	mono_cominterop_cleanup ();
 
-	TlsFree (load_type_info_tls_id);
-	TlsFree (last_error_tls_id);
+	mono_native_tls_free (load_type_info_tls_id);
+	mono_native_tls_free (last_error_tls_id);
 	DeleteCriticalSection (&marshal_mutex);
 	marshal_mutex_initialized = FALSE;
 }
@@ -8705,6 +8707,7 @@ mono_marshal_set_callconv_from_modopt (MonoMethod *method, MonoMethodSignature *
 
 /*
  * generates IL code to call managed methods from unmanaged code 
+ * If target_handle==0, the wrapper info will be a NativeToManagedWrapperInfo structure.
  */
 MonoMethod *
 mono_marshal_get_managed_wrapper (MonoMethod *method, MonoClass *delegate_klass, uint32_t target_handle)
@@ -8839,10 +8842,17 @@ mono_marshal_get_managed_wrapper (MonoMethod *method, MonoClass *delegate_klass,
 
 	mono_marshal_emit_managed_wrapper (mb, invoke_sig, mspecs, &m, method, target_handle);
 
-	if (!target_handle)
+	if (!target_handle) {
+		NativeToManagedWrapperInfo *info;
+
 		res = mono_mb_create_and_cache (cache, method,
 											 mb, csig, sig->param_count + 16);
-	else {
+		// FIXME: Associate it with the method+delegate_klass pair
+		info = mono_image_alloc0 (method->klass->image, sizeof (NativeToManagedWrapperInfo));
+		info->method = method;
+		info->klass = delegate_klass;
+		mono_marshal_set_wrapper_info (res, info);
+	} else {
 		mb->dynamic = 1;
 		res = mono_mb_create_method (mb, csig, sig->param_count + 16);
 	}
@@ -10470,6 +10480,7 @@ mono_marshal_get_array_address (int rank, int elem_size)
 		elem_addr_cache [elem_addr_cache_next].rank = rank;
 		elem_addr_cache [elem_addr_cache_next].elem_size = elem_size;
 		elem_addr_cache [elem_addr_cache_next].method = ret;
+		elem_addr_cache_next ++;
 
 		info = mono_image_alloc0 (mono_defaults.corlib, sizeof (ElementAddrWrapperInfo));
 		info->rank = rank;
@@ -10548,9 +10559,9 @@ void
 mono_marshal_set_last_error (void)
 {
 #ifdef WIN32
-	TlsSetValue (last_error_tls_id, GINT_TO_POINTER (GetLastError ()));
+	mono_native_tls_set_value (last_error_tls_id, GINT_TO_POINTER (GetLastError ()));
 #else
-	TlsSetValue (last_error_tls_id, GINT_TO_POINTER (errno));
+	mono_native_tls_set_value (last_error_tls_id, GINT_TO_POINTER (errno));
 #endif
 }
 
@@ -10558,7 +10569,7 @@ static void
 mono_marshal_set_last_error_windows (int error)
 {
 #ifdef WIN32
-	TlsSetValue (last_error_tls_id, GINT_TO_POINTER (error));
+	mono_native_tls_set_value (last_error_tls_id, GINT_TO_POINTER (error));
 #endif
 }
 
@@ -10800,7 +10811,7 @@ ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error (void)
 {
 	MONO_ARCH_SAVE_REGS;
 
-	return (GPOINTER_TO_INT (TlsGetValue (last_error_tls_id)));
+	return (GPOINTER_TO_INT (mono_native_tls_get_value (last_error_tls_id)));
 }
 
 guint32 
@@ -11200,7 +11211,7 @@ ves_icall_System_Runtime_InteropServices_Marshal_GetDelegateForFunctionPointerIn
 static gboolean
 mono_marshal_is_loading_type_info (MonoClass *klass)
 {
-	GSList *loads_list = TlsGetValue (load_type_info_tls_id);
+	GSList *loads_list = mono_native_tls_get_value (load_type_info_tls_id);
 
 	return g_slist_find (loads_list, klass) != NULL;
 }
@@ -11245,9 +11256,9 @@ mono_marshal_load_type_info (MonoClass* klass)
 	 * under initialization in a TLS list.
 	 */
 	g_assert (!mono_marshal_is_loading_type_info (klass));
-	loads_list = TlsGetValue (load_type_info_tls_id);
+	loads_list = mono_native_tls_get_value (load_type_info_tls_id);
 	loads_list = g_slist_prepend (loads_list, klass);
-	TlsSetValue (load_type_info_tls_id, loads_list);
+	mono_native_tls_set_value (load_type_info_tls_id, loads_list);
 	
 	iter = NULL;
 	while ((field = mono_class_get_fields (klass, &iter))) {
@@ -11349,9 +11360,9 @@ mono_marshal_load_type_info (MonoClass* klass)
 		mono_marshal_load_type_info (klass->element_class);
 	}
 
-	loads_list = TlsGetValue (load_type_info_tls_id);
+	loads_list = mono_native_tls_get_value (load_type_info_tls_id);
 	loads_list = g_slist_remove (loads_list, klass);
-	TlsSetValue (load_type_info_tls_id, loads_list);
+	mono_native_tls_set_value (load_type_info_tls_id, loads_list);
 
 	/*We do double-checking locking on marshal_info */
 	mono_memory_barrier ();

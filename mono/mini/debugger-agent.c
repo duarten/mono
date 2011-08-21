@@ -5,6 +5,7 @@
  *   Zoltan Varga (vargaz@gmail.com)
  *
  * Copyright 2009-2010 Novell, Inc.
+ * Copyright 2011 Xamarin Inc.
  */
 
 #include <config.h>
@@ -564,7 +565,7 @@ static int frame_id = 0;
 
 static GPtrArray *event_requests;
 
-static guint32 debugger_tls_id;
+static MonoNativeTlsKey debugger_tls_id;
 
 static gboolean vm_start_event_sent, vm_death_event_sent, disconnected;
 
@@ -850,7 +851,7 @@ mono_debugger_agent_init (void)
 	mono_profiler_install_jit_end (jit_end);
 	mono_profiler_install_method_invoke (start_runtime_invoke, end_runtime_invoke);
 
-	debugger_tls_id = TlsAlloc ();
+	mono_native_tls_alloc (&debugger_tls_id, NULL);
 
 	thread_to_tls = mono_g_hash_table_new_type (NULL, NULL, MONO_HASH_KEY_GC);
 	MONO_GC_REGISTER_ROOT_FIXED (thread_to_tls);
@@ -2005,7 +2006,7 @@ save_thread_context (MonoContext *ctx)
 {
 	DebuggerTlsData *tls;
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 
 	if (ctx)
@@ -2084,7 +2085,7 @@ mono_debugger_agent_thread_interrupt (void *sigctx, MonoJitInfo *ji)
 	if (!inited)
 		return FALSE;
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	if (!tls)
 		return FALSE;
 
@@ -2152,7 +2153,13 @@ mono_debugger_agent_thread_interrupt (void *sigctx, MonoJitInfo *ji)
 			data.last_frame_set = FALSE;
 			if (sigctx) {
 				mono_arch_sigctx_to_monoctx (sigctx, &ctx);
-				mono_walk_stack_with_ctx (get_last_frame, &ctx, MONO_UNWIND_DEFAULT, &data);
+				mono_arch_sigctx_to_monoctx (sigctx, &ctx);
+				/* 
+				 * Don't pass MONO_UNWIND_ACTUAL_METHOD, its not signal safe, and
+				 * get_last_frame () doesn't need it, the last frame cannot be a ginst
+				 * since we are not in a JITted method.
+				 */
+				mono_walk_stack_with_ctx (get_last_frame, &ctx, MONO_UNWIND_NONE, &data);
 			}
 			if (data.last_frame_set) {
 				memcpy (&tls->async_last_frame, &data.last_frame, sizeof (StackFrameInfo));
@@ -2392,7 +2399,7 @@ invalidate_frames (DebuggerTlsData *tls)
 	int i;
 
 	if (!tls)
-		tls = TlsGetValue (debugger_tls_id);
+		tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 
 	for (i = 0; i < tls->frame_count; ++i) {
@@ -2427,7 +2434,7 @@ suspend_current (void)
 		return;
 	}
 
- 	tls = TlsGetValue (debugger_tls_id);
+ 	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 
 	mono_mutex_lock (&suspend_mutex);
@@ -3259,14 +3266,14 @@ thread_startup (MonoProfiler *prof, uintptr_t tid)
 		}
 	}
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (!tls);
 	// FIXME: Free this somewhere
 	tls = g_new0 (DebuggerTlsData, 1);
 	tls->resume_event = CreateEvent (NULL, FALSE, FALSE, NULL);
 	MONO_GC_REGISTER_ROOT_SINGLE (tls->thread);
 	tls->thread = thread;
-	TlsSetValue (debugger_tls_id, tls);
+	mono_native_tls_set_value (debugger_tls_id, tls);
 
 	DEBUG (1, fprintf (log_file, "[%p] Thread started, obj=%p, tls=%p.\n", (gpointer)tid, thread, tls));
 
@@ -4031,7 +4038,7 @@ process_signal_event (void (*func) (DebuggerTlsData*))
 	if (!restore_context)
 		restore_context = mono_get_restore_context ();
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	/* Have to save/restore the restore_ctx as we can be called recursively during invokes etc. */
 	memcpy (&orig_restore_ctx, &tls->restore_ctx, sizeof (MonoContext));
 	memcpy (&tls->restore_ctx, &tls->handler_ctx, sizeof (MonoContext));
@@ -4059,7 +4066,7 @@ resume_from_signal_handler (void *sigctx, void *func)
 
 	/* Save the original context in TLS */
 	// FIXME: This might not work on an altstack ?
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 
 	// FIXME: MonoContext usually doesn't include the fp registers, so these are 
@@ -4323,7 +4330,7 @@ debugger_agent_single_step_from_context (MonoContext *ctx)
 {
 	DebuggerTlsData *tls;
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 	memcpy (&tls->restore_ctx, ctx, sizeof (MonoContext));
 
@@ -4335,7 +4342,7 @@ debugger_agent_breakpoint_from_context (MonoContext *ctx)
 {
 	DebuggerTlsData *tls;
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 	memcpy (&tls->restore_ctx, ctx, sizeof (MonoContext));
 
@@ -4723,7 +4730,7 @@ mono_debugger_agent_begin_exception_filter (MonoException *exc, MonoContext *ctx
 	if (!inited)
 		return;
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	if (!tls)
 		return;
 
@@ -4762,7 +4769,7 @@ mono_debugger_agent_end_exception_filter (MonoException *exc, MonoContext *ctx, 
 	if (!inited)
 		return;
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	if (!tls)
 		return;
 
@@ -5503,7 +5510,7 @@ invoke_method (void)
 	if (!restore_context)
 		restore_context = mono_get_restore_context ();
 
-	tls = TlsGetValue (debugger_tls_id);
+	tls = mono_native_tls_get_value (debugger_tls_id);
 	g_assert (tls);
 
 	/*

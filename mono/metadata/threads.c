@@ -9,6 +9,7 @@
  *
  * Copyright 2001-2003 Ximian, Inc (http://www.ximian.com)
  * Copyright 2004-2009 Novell, Inc (http://www.novell.com)
+ * Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
  */
 
 #include <config.h>
@@ -49,6 +50,7 @@
 #include <mono/utils/mono-time.h>
 #include <mono/utils/mono-threads.h>
 #include <mono/utils/hazard-pointer.h>
+#include <mono/utils/mono-tls.h>
 #include <mono/utils/st.h>
 
 #ifdef PLATFORM_ANDROID
@@ -149,7 +151,7 @@ static MonoGHashTable *threads_starting_up = NULL;
 static MonoGHashTable *thread_start_args = NULL;
 
 /* The TLS key that holds the MonoObject assigned to each thread */
-static guint32 current_object_key = -1;
+static MonoNativeTlsKey current_object_key;
 
 #ifdef MONO_HAVE_FAST_TLS
 /* we need to use both the Tls* functions and __thread because
@@ -158,12 +160,12 @@ static guint32 current_object_key = -1;
 MONO_FAST_TLS_DECLARE(tls_current_object);
 #define SET_CURRENT_OBJECT(x) do { \
 	MONO_FAST_TLS_SET (tls_current_object, x); \
-	TlsSetValue (current_object_key, x); \
+	mono_native_tls_set_value (current_object_key, x); \
 } while (FALSE)
 #define GET_CURRENT_OBJECT() ((MonoInternalThread*) MONO_FAST_TLS_GET (tls_current_object))
 #else
-#define SET_CURRENT_OBJECT(x) TlsSetValue (current_object_key, x)
-#define GET_CURRENT_OBJECT() (MonoInternalThread*) TlsGetValue (current_object_key)
+#define SET_CURRENT_OBJECT(x) mono_native_tls_set_value (current_object_key, x)
+#define GET_CURRENT_OBJECT() (MonoInternalThread*) mono_native_tls_get_value (current_object_key)
 #endif
 
 /* function called at thread start */
@@ -222,7 +224,7 @@ get_next_managed_thread_id (void)
 	return InterlockedIncrement (&managed_thread_id_counter);
 }
 
-guint32
+MonoNativeTlsKey
 mono_thread_get_tls_key (void)
 {
 	return current_object_key;
@@ -364,7 +366,6 @@ static void free_abandoned_mutexs (MonoInternalThread *thread)
  */
 static void thread_cleanup (MonoInternalThread *thread)
 {
-	
 	g_assert (thread != NULL);
 
 	if (thread->abort_state_handle) {
@@ -796,6 +797,9 @@ mono_thread_get_stack_bounds (guint8 **staddr, size_t *stsize)
 #if defined(HAVE_PTHREAD_GET_STACKSIZE_NP) && defined(HAVE_PTHREAD_GET_STACKADDR_NP)
 	*staddr = (guint8*)pthread_get_stackaddr_np (pthread_self ());
 	*stsize = pthread_get_stacksize_np (pthread_self ());
+
+	/* staddr points to the start of the stack, not the end */
+	*staddr -= *stsize;
 	*staddr = (guint8*)((gssize)*staddr & ~(mono_pagesize () - 1));
 	return;
 	/* FIXME: simplify the mess below */
@@ -2459,7 +2463,7 @@ void mono_thread_init (MonoThreadStartCB start_cb,
 	mono_init_static_data_info (&context_static_info);
 
 	MONO_FAST_TLS_INIT (tls_current_object);
-	current_object_key=TlsAlloc();
+	mono_native_tls_alloc (&current_object_key, NULL);
 	THREAD_DEBUG (g_message ("%s: Allocated current_object_key %d", __func__, current_object_key));
 
 	mono_thread_start_cb = start_cb;
@@ -2502,7 +2506,7 @@ void mono_thread_cleanup (void)
 	CloseHandle (background_change_event);
 #endif
 
-	TlsFree (current_object_key);
+	mono_native_tls_free (current_object_key);
 }
 
 void

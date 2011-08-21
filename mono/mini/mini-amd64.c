@@ -10,6 +10,8 @@
  *   Zoltan Varga (vargaz@gmail.com)
  *
  * (C) 2003 Ximian, Inc.
+ * Copyright 2003-2011 Novell, Inc (http://www.novell.com)
+ * Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
  */
 #include "mini.h"
 #include <string.h>
@@ -27,6 +29,7 @@
 #include <mono/utils/mono-math.h>
 #include <mono/utils/mono-mmap.h>
 #include <mono/utils/mono-memory-model.h>
+#include <mono/utils/mono-tls.h>
 
 #include "trace.h"
 #include "ir-emit.h"
@@ -213,49 +216,49 @@ amd64_is_near_call (guint8 *code)
 /* amd64_call_reg_internal, which uses amd64_alu_* macros, etc.             */
 /* We only want to force bundle alignment for the top level instruction,    */
 /* so NaCl pseudo-instructions can be implemented with sub instructions.    */
-static guint32 nacl_instruction_depth;
+static MonoNativeTlsKey nacl_instruction_depth;
 
-static guint32 nacl_rex_tag;
-static guint32 nacl_legacy_prefix_tag;
+static MonoNativeTlsKey nacl_rex_tag;
+static MonoNativeTlsKey nacl_legacy_prefix_tag;
 
 void
 amd64_nacl_clear_legacy_prefix_tag ()
 {
-	TlsSetValue (nacl_legacy_prefix_tag, NULL);
+	mono_native_tls_set_value (nacl_legacy_prefix_tag, NULL);
 }
 
 void
 amd64_nacl_tag_legacy_prefix (guint8* code)
 {
-	if (TlsGetValue (nacl_legacy_prefix_tag) == NULL)
-		TlsSetValue (nacl_legacy_prefix_tag, code);
+	if (mono_native_tls_get_value (nacl_legacy_prefix_tag) == NULL)
+		mono_native_tls_set_value (nacl_legacy_prefix_tag, code);
 }
 
 void
 amd64_nacl_tag_rex (guint8* code)
 {
-	TlsSetValue (nacl_rex_tag, code);
+	mono_native_tls_set_value (nacl_rex_tag, code);
 }
 
 guint8*
 amd64_nacl_get_legacy_prefix_tag ()
 {
-	return (guint8*)TlsGetValue (nacl_legacy_prefix_tag);
+	return (guint8*)mono_native_tls_get_value (nacl_legacy_prefix_tag);
 }
 
 guint8*
 amd64_nacl_get_rex_tag ()
 {
-	return (guint8*)TlsGetValue (nacl_rex_tag);
+	return (guint8*)mono_native_tls_get_value (nacl_rex_tag);
 }
 
 /* Increment the instruction "depth" described above */
 void
 amd64_nacl_instruction_pre ()
 {
-	intptr_t depth = (intptr_t) TlsGetValue (nacl_instruction_depth);
+	intptr_t depth = (intptr_t) mono_native_tls_get_value (nacl_instruction_depth);
 	depth++;
-	TlsSetValue (nacl_instruction_depth, (gpointer)depth);
+	mono_native_tls_set_value (nacl_instruction_depth, (gpointer)depth);
 }
 
 /* amd64_nacl_instruction_post: Decrement instruction "depth", force bundle */
@@ -266,9 +269,9 @@ amd64_nacl_instruction_pre ()
 void
 amd64_nacl_instruction_post (guint8 **start, guint8 **end)
 {
-	intptr_t depth = (intptr_t) TlsGetValue(nacl_instruction_depth);
+	intptr_t depth = (intptr_t) mono_native_tls_get_value (nacl_instruction_depth);
 	depth--;
-	TlsSetValue (nacl_instruction_depth, (void*)depth);
+	mono_native_tls_set_value (nacl_instruction_depth, (void*)depth);
 
 	g_assert ( depth >= 0 );
 	if (depth == 0) {
@@ -1287,10 +1290,10 @@ mono_arch_init (void)
 
 	InitializeCriticalSection (&mini_arch_mutex);
 #if defined(__native_client_codegen__)
-	nacl_instruction_depth = TlsAlloc ();
-	TlsSetValue (nacl_instruction_depth, (gpointer)0);
-	nacl_rex_tag = TlsAlloc ();
-	nacl_legacy_prefix_tag = TlsAlloc ();
+	mono_native_tls_alloc (&nacl_instruction_depth, NULL);
+	mono_native_tls_set_value (nacl_instruction_depth, (gpointer)0);
+	mono_native_tls_alloc (&nacl_rex_tag, NULL);
+	mono_native_tls_alloc (&nacl_legacy_prefix_tag, NULL);
 #endif
 
 #ifdef MONO_ARCH_NOMAP32BIT
@@ -1325,9 +1328,9 @@ mono_arch_cleanup (void)
 {
 	DeleteCriticalSection (&mini_arch_mutex);
 #if defined(__native_client_codegen__)
-	TlsFree (nacl_instruction_depth);
-	TlsFree (nacl_rex_tag);
-	TlsFree (nacl_legacy_prefix_tag);
+	mono_native_tls_free (nacl_instruction_depth);
+	mono_native_tls_free (nacl_rex_tag);
+	mono_native_tls_free (nacl_legacy_prefix_tag);
 #endif
 }
 
@@ -5711,6 +5714,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 
 			gpointer card_table = mono_gc_get_card_table (&card_table_shift, &card_table_mask);
 			guint64 nursery_start = (guint64)mono_gc_get_nursery (&nursery_shift, &nursery_size);
+			guint64 shifted_nursery_start = nursery_start >> nursery_shift;
 
 			/*If either point to the stack we can simply avoid the WB. This happens due to
 			 * optimizations revealing a stack store that was not visible when op_cardtable was emited.
@@ -5743,7 +5747,19 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 			if (value != AMD64_RDX)
 				amd64_mov_reg_reg (code, AMD64_RDX, value, 8);
 			amd64_shift_reg_imm (code, X86_SHR, AMD64_RDX, nursery_shift);
-			amd64_alu_reg_imm (code, X86_CMP, AMD64_RDX, nursery_start >> nursery_shift);
+			if (shifted_nursery_start >> 31) {
+				/*
+				 * The value we need to compare against is 64 bits, so we need
+				 * another spare register.  We use RBX, which we save and
+				 * restore.
+				 */
+				amd64_mov_membase_reg (code, AMD64_RSP, -8, AMD64_RBX, 8);
+				amd64_mov_reg_imm (code, AMD64_RBX, shifted_nursery_start);
+				amd64_alu_reg_reg (code, X86_CMP, AMD64_RDX, AMD64_RBX);
+				amd64_mov_reg_membase (code, AMD64_RBX, AMD64_RSP, -8, 8);
+			} else {
+				amd64_alu_reg_imm (code, X86_CMP, AMD64_RDX, shifted_nursery_start);
+			}
 			br = code; x86_branch8 (code, X86_CC_NE, -1, FALSE);
 			amd64_mov_reg_reg (code, AMD64_RDX, ptr, 8);
 			amd64_shift_reg_imm (code, X86_SHR, AMD64_RDX, card_table_shift);

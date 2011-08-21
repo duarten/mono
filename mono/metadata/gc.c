@@ -1276,7 +1276,12 @@ mono_gc_parse_environment_string_extract_number (const char *str, glong *out)
 	gboolean is_suffix = FALSE;
 	char suffix;
 
-	switch (str [len - 1]) {
+	if (!len)
+		return FALSE;
+
+	suffix = str [len - 1];
+
+	switch (suffix) {
 		case 'g':
 		case 'G':
 			shift += 10;
@@ -1287,10 +1292,11 @@ mono_gc_parse_environment_string_extract_number (const char *str, glong *out)
 		case 'K':
 			shift += 10;
 			is_suffix = TRUE;
-			suffix = str [len - 1];
 			break;
 		default:
-			return FALSE;
+			if (!isdigit (suffix))
+				return FALSE;
+			break;
 	}
 
 	errno = 0;
@@ -1543,6 +1549,17 @@ void
 mono_gc_memmove (void *dest, const void *src, size_t size)
 {
 	/*
+	 * If dest and src are differently aligned with respect to
+	 * pointer size then it makes no sense to do aligned copying.
+	 * In fact, we would end up with unaligned loads which is
+	 * incorrect on some architectures.
+	 */
+	if ((char*)dest - (char*)align_down (dest) != (char*)src - (char*)align_down (src)) {
+		memmove (dest, src, size);
+		return;
+	}
+
+	/*
 	 * A bit of explanation on why we align only dest before doing word copies.
 	 * Pointers to managed objects must always be stored in word aligned addresses, so
 	 * even if dest is misaligned, src will be by the same amount - this ensure proper atomicity of reads.
@@ -1551,7 +1568,7 @@ mono_gc_memmove (void *dest, const void *src, size_t size)
 		char *p = (char*)dest + size;
 		char *s = (char*)src + size;
 		char *start = (char*)dest;
-		char *align_end = MAX((char*)p, (char*)align_down (p));
+		char *align_end = MAX((char*)dest, (char*)align_down (p));
 		char *word_start;
 
 		while (p > align_end)

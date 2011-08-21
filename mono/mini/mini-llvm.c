@@ -1,12 +1,14 @@
 /*
  * mini-llvm.c: llvm "Backend" for the mono JIT
  *
- * (C) 2009 Novell, Inc.
+ * Copyright 2009-2011 Novell Inc (http://www.novell.com)
+ * Copyright 2011 Xamarin Inc (http://www.xamarin.com)
  */
 
 #include "mini.h"
 #include <mono/metadata/debug-helpers.h>
 #include <mono/metadata/mempool-internals.h>
+#include <mono/utils/mono-tls.h>
 
 #ifndef __STDC_LIMIT_MACROS
 #define __STDC_LIMIT_MACROS
@@ -181,7 +183,7 @@ static LLVMRealPredicate fpcond_to_llvm_cond [] = {
 };
 
 static LLVMExecutionEngineRef ee;
-static guint32 current_cfg_tls_id;
+static MonoNativeTlsKey current_cfg_tls_id;
 
 static MonoLLVMModule jit_module, aot_module;
 static gboolean jit_module_inited;
@@ -2467,7 +2469,16 @@ process_bb (EmitContext *ctx, MonoBasicBlock *bb)
 				cmp = LLVMBuildICmp (builder, cond_to_llvm_cond [rel], lhs, rhs, "");
 
 			if (MONO_IS_COND_BRANCH_OP (ins->next)) {
-				LLVMBuildCondBr (builder, cmp, get_bb (ctx, ins->next->inst_true_bb), get_bb (ctx, ins->next->inst_false_bb));
+				if (ins->next->inst_true_bb == ins->next->inst_false_bb) {
+					/*
+					 * If the target bb contains PHI instructions, LLVM requires
+					 * two PHI entries for this bblock, while we only generate one.
+					 * So convert this to an unconditional bblock. (bxc #171).
+					 */
+					LLVMBuildBr (builder, get_bb (ctx, ins->next->inst_true_bb));
+				} else {
+					LLVMBuildCondBr (builder, cmp, get_bb (ctx, ins->next->inst_true_bb), get_bb (ctx, ins->next->inst_false_bb));
+				}
 				has_terminator = TRUE;
 			} else if (MONO_IS_SETCC (ins->next)) {
 				sprintf (dname_buf, "t%d", ins->next->dreg);
@@ -4226,7 +4237,7 @@ mono_llvm_emit_method (MonoCompile *cfg)
 	mono_loader_lock ();
 
 	/* Used to communicate with the callbacks */
-	TlsSetValue (current_cfg_tls_id, cfg);
+	mono_native_tls_set_value (current_cfg_tls_id, cfg);
 
 	ctx = g_new0 (EmitContext, 1);
 	ctx->cfg = cfg;
@@ -4608,7 +4619,7 @@ mono_llvm_emit_method (MonoCompile *cfg)
 
 	g_free (ctx);
 
-	TlsSetValue (current_cfg_tls_id, NULL);
+	mono_native_tls_set_value (current_cfg_tls_id, NULL);
 
 	mono_loader_unlock ();
 }
@@ -4686,7 +4697,7 @@ alloc_cb (LLVMValueRef function, int size)
 {
 	MonoCompile *cfg;
 
-	cfg = TlsGetValue (current_cfg_tls_id);
+	cfg = mono_native_tls_get_value (current_cfg_tls_id);
 
 	if (cfg) {
 		// FIXME: dynamic
@@ -4701,7 +4712,7 @@ emitted_cb (LLVMValueRef function, void *start, void *end)
 {
 	MonoCompile *cfg;
 
-	cfg = TlsGetValue (current_cfg_tls_id);
+	cfg = mono_native_tls_get_value (current_cfg_tls_id);
 	g_assert (cfg);
 	cfg->code_len = (guint8*)end - (guint8*)start;
 }
@@ -4715,7 +4726,7 @@ exception_cb (void *data)
 	gpointer *type_info;
 	int this_reg, this_offset;
 
-	cfg = TlsGetValue (current_cfg_tls_id);
+	cfg = mono_native_tls_get_value (current_cfg_tls_id);
 	g_assert (cfg);
 
 	/*
@@ -5090,7 +5101,7 @@ add_intrinsics (LLVMModuleRef module)
 void
 mono_llvm_init (void)
 {
-	current_cfg_tls_id = TlsAlloc ();
+	mono_native_tls_alloc (&current_cfg_tls_id, NULL);
 }
 
 static void
