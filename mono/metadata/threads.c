@@ -365,7 +365,6 @@ static void free_abandoned_mutexs (MonoInternalThread *thread)
  */
 static void thread_cleanup (MonoInternalThread *thread)
 {
-	
 	g_assert (thread != NULL);
 
 	if (thread->abort_state_handle) {
