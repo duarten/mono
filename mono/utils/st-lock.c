@@ -5,6 +5,7 @@
  *	Duarte Nunes (duarte.m.nunes@gmail.com)
  */
 
+#include <mono/utils/mono-time.h>
 #include <mono/utils/st.h>
 
 //
@@ -84,9 +85,9 @@ st_lock_slow_enter (StLock *lock, guint32 timeout)
 	 guint32 wait_status;
 	 guint32 spin_count;
 
-	 last_time = (timeout != INFINITE) ? GetTickCount() : 0;
+	 last_time = timeout != INFINITE ? mono_msec_ticks () : 0;
 
-	 st_wait_block_init (&wait_block, &parker, WAIT_SUCCESS);
+	 st_wait_block_init (&wait_block, &parker, 0, WAIT_SUCCESS);
 
 	 do {
 		spin_count = lock->spin_count;
@@ -109,7 +110,7 @@ st_lock_slow_enter (StLock *lock, guint32 timeout)
 
 		do {
 			if ((state = lock->state) == LOCK_FREE) {
-				if (InterlockedCompareExchangePointer ((gpointer *)&lock->state, LOCK_BUSY, LOCK_FREE) == state) {
+				if (InterlockedCompareExchangePointer ((gpointer *)&lock->state, LOCK_BUSY, LOCK_FREE) == LOCK_FREE) {
 					return TRUE;
 				}
 				continue;
@@ -121,7 +122,7 @@ st_lock_slow_enter (StLock *lock, guint32 timeout)
 			}
 		} while (TRUE);
 
-		wait_status = st_parker_park_ex (&parker, 0, timeout, NULL);
+		wait_status = st_parker_park_ex (&parker, 0, timeout, NULL, FALSE);
 
 		if (wait_status != WAIT_SUCCESS) {
 			unlink_list_entry (lock, &wait_block.wait_list_entry);

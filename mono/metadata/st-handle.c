@@ -21,7 +21,7 @@
  */
 
 static MonoGHashTable *handles = NULL;
-static guint32 cur_handle = 0;
+static guint32 next_handle = 1;
 static StLock lock;
 
 /*
@@ -42,10 +42,12 @@ ves_icall_System_Threading_StInternalMethods_RegisterHandle_internal (MonoObject
 
 	st_lock_enter (&lock);
 	
-	if (handle == (~0 - 1)) {
-		handle = cur_handle = 1;
+	handle = next_handle;
+
+	if (next_handle == (~0 - 1)) {
+		next_handle = 1;
 	} else {
-		handle += 1;
+		next_handle += 1;
 	}
 	
 	mono_g_hash_table_insert (handles, (gpointer)handle, (gpointer)obj);
@@ -68,7 +70,7 @@ ves_icall_System_Threading_StInternalMethods_ResolveHandle_internal (gpointer ha
 	return (MonoObject *) waitable;
 }
 
-gboolean 
+MonoBoolean 
 ves_icall_System_Threading_StInternalMethods_RemoveHandle_internal (gpointer handle) 
 {
 	gboolean removed;

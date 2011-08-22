@@ -29,6 +29,7 @@
 #include <mono/utils/mono-time.h>
 #include <mono/utils/mono-threads.h>
 #include <mono/utils/mono-memory-model.h>
+#include <mono/utils/st.h>
 
 /*
  * Pull the list of opcodes
@@ -102,16 +103,15 @@ enum {
 	LOCK_WORD_HASH_SHIFT = LOCK_WORD_STATUS_BITS
 };
 
+#define MONITOR_SPIN_COUNT 256
+
 struct _MonoThreadsSync
 {
-	int owner;			/* thread ID */
-	guint32 nest;
+	StReentrantFairLock lock;
+	ListEntry wait_list;
 #ifdef HAVE_MOVING_COLLECTOR
 	gint32 hash_code;
 #endif
-	volatile guint32 entry_count;
-	HANDLE entry_sem;
-	GSList *wait_list;
 	void *data;
 };
 
@@ -142,18 +142,18 @@ mono_monitor_init (void)
  
 void
 mono_monitor_cleanup (void)
-{
-	MonoThreadsSync *mon;
-	/* MonitorArray *marray, *next = NULL; */
+{	
+	/*MonoThreadsSync *mon;
+	  MonitorArray *marray, *next = NULL;*/
 
 	/*DeleteCriticalSection (&monitor_mutex);*/
 
 	/*g_hash_table_destroy (monitor_table);*/
 
 	/* The monitors on the freelist don't have weak links - mark them */
-	for (mon = monitor_freelist; mon; mon = mon->data)
+	/*for (mon = monitor_freelist; mon; mon = mon->data)
 		mon->wait_list = (gpointer)-1;
-
+	*/
 	/* FIXME: This still crashes with sgen (async_read.exe) */
 	/*
 	for (marray = monitor_allocated; marray; marray = next) {
@@ -220,11 +220,11 @@ mono_locks_dump (gboolean include_untaken)
 			} else {
 				if (!monitor_is_on_freelist ((MonoThreadsSync *) mon->data)) {
 					MonoObject *holder = mono_gc_weak_link_get (&mon->data);
-					if (mon->owner) {
+					if (mon->lock.owner) {
 						g_print ("Lock %p in object %p held by thread %p, nest level: %d\n",
-							mon, holder, (void*)mon->owner, mon->nest);
-						if (mon->entry_sem)
-							g_print ("\tWaiting on semaphore %p: %d\n", mon->entry_sem, mon->entry_count);
+							mon, holder, (void*)mon->lock.owner, mon->lock.nest);
+						if (mon->lock.lock.queue.front_request != 0)
+							g_print ("\tThere are threads waiting to acquire the lock\n");
 					} else if (include_untaken) {
 						g_print ("Lock %p in object %p untaken\n", mon, holder);
 					}
@@ -243,19 +243,6 @@ mon_finalize (MonoThreadsSync *mon)
 {
 	LOCK_DEBUG (g_message ("%s: Finalizing sync %p", __func__, mon));
 
-	if (mon->entry_sem != NULL) {
-		CloseHandle (mon->entry_sem);
-		mon->entry_sem = NULL;
-	}
-	/* If this isn't empty then something is seriously broken - it
-	 * means a thread is still waiting on the object that owned
-	 * this lock, but the object has been finalized.
-	 */
-	g_assert (mon->wait_list == NULL);
-
-	mon->entry_count = 0;
-	/* owner and nest are set in mon_new, no need to zero them out */
-
 	mono_gc_weak_link_remove (&mon->data);
 	mon->data = monitor_freelist;
 	monitor_freelist = mon;
@@ -264,7 +251,7 @@ mon_finalize (MonoThreadsSync *mon)
 
 /* LOCKING: this is called with monitor_mutex held */
 static MonoThreadsSync *
-mon_new (int id)
+mon_new ()
 {
 	MonoThreadsSync *new;
 
@@ -277,15 +264,6 @@ mon_new (int id)
 			for (i = 0; i < marray->num_monitors; ++i) {
 				if (marray->monitors [i].data == NULL) {
 					new = &marray->monitors [i];
-					if (new->wait_list) {
-						/* Orphaned events left by aborted threads */
-						while (new->wait_list) {
-							LOCK_DEBUG (g_message (G_GNUC_PRETTY_FUNCTION ": (%d): Closing orphaned event %d", mono_thread_info_get_small_id (), new->wait_list->data));
-							CloseHandle (new->wait_list->data);
-							new->wait_list = g_slist_remove (new->wait_list, new->wait_list->data);
-						}
-					}
-					/*mono_gc_weak_link_remove (&new->data);*/
 					new->data = monitor_freelist;
 					monitor_freelist = new;
 				}
@@ -324,23 +302,24 @@ mon_new (int id)
 	new = monitor_freelist;
 	monitor_freelist = new->data;
 
-	new->owner = id;
-	new->entry_count = 0;
+	st_reentrant_fair_lock_init (&new->lock, TRUE, MONITOR_SPIN_COUNT);
 	
 	mono_perfcounters->gc_sync_blocks++;
 	return new;
 }
 
 static inline void
-mono_monitor_ensure_synchronized (LockWord lw, guint32 id)
+mono_monitor_ensure_synchronized (LockWord lw)
 {
+	guint32 id = mono_thread_info_get_small_id ();
+
 	if ((lw.lock_word & LOCK_WORD_BITS_MASK) == 0) {
 		if ((((unsigned int)lw.lock_word) >> LOCK_WORD_OWNER_SHIFT) == id) {
 			return;
 		}
 	} else if (lw.lock_word & LOCK_WORD_INFLATED) {
 		lw.lock_word &= ~LOCK_WORD_BITS_MASK;
-		if (lw.sync->owner == id) {
+		if (lw.sync->lock.owner == id) {
 			return;
 		}
 	}
@@ -357,25 +336,8 @@ mono_monitor_ensure_synchronized (LockWord lw, guint32 id)
 static inline void
 mono_monitor_exit_inflated (MonoObject *obj, MonoThreadsSync *mon)
 {
-	if (G_LIKELY (mon->nest == 0)) {
-		LOCK_DEBUG (g_message ("%s: (%d) Object %p is now unlocked", __func__, mono_thread_info_get_small_id (), obj));
-	
-		mon->owner = 0;
-
-		/* Do the wakeup stuff. It's possible that the last
-		 * blocking thread gave up waiting just before we
-		 * release the semaphore resulting in a futile wakeup
-		 * next time there's contention for this object, but
-		 * it means we don't have to waste time locking the
-		 * struct.
-		 */
-		if (mon->entry_count > 0) {
-			ReleaseSemaphore (mon->entry_sem, 1, NULL);
-		}
-	} else {
-		mon->nest -= 1;
-		LOCK_DEBUG (g_message ("%s: (%d) Object %p is now locked %d times", __func__, mono_thread_info_get_small_id (), obj, mon->nest + 1));		
-	}
+	st_reentrant_fair_lock_exit (&mon->lock);
+	LOCK_DEBUG (g_message ("%s: (%d) Unlocked %p (owner: %d, nest: %d)", __func__, mono_thread_info_get_small_id (), obj, mon->lock.owner, mon->nest));
 }
 
 /*
@@ -387,19 +349,18 @@ mono_monitor_exit_flat (MonoObject *obj, LockWord lw)
 {
 	if (G_UNLIKELY (lw.lock_word & LOCK_WORD_NEST_MASK)) {
 		lw.lock_word -= 1 << LOCK_WORD_NEST_SHIFT;
-		LOCK_DEBUG (g_message ("%s: (%d) Object %p is now locked %d times", __func__, mono_thread_info_get_small_id (), obj, ((lw.lock_word & LOCK_WORD_NEST_MASK) >> LOCK_WORD_NEST_SHIFT) + 1));		
 	} else {
 		lw.lock_word = 0;
-		LOCK_DEBUG (g_message ("%s: (%d) Object %p is now unlocked", __func__, mono_thread_info_get_small_id (), obj));
 	}
 	obj->synchronisation = lw.sync;
 	UNLOCK_FENCE;
+
+	LOCK_DEBUG (g_message ("%s: (%d) Unlocked %p (lock word: %p)", __func__, mono_thread_info_get_small_id (), obj, lw.sync));
 }
 
 void
 mono_monitor_exit (MonoObject *obj)
 {
-	guint32 id;
 	LockWord lw;
 	
 	LOCK_DEBUG (g_message ("%s: (%d) Unlocking %p", __func__, mono_thread_info_get_small_id (), obj));
@@ -409,10 +370,9 @@ mono_monitor_exit (MonoObject *obj)
 		return;
 	}
 
-	id = mono_thread_info_get_small_id ();
 	lw.sync = obj->synchronisation;
 
-	mono_monitor_ensure_synchronized (lw, id);
+	mono_monitor_ensure_synchronized (lw);
 
 	if (G_UNLIKELY (lw.lock_word & LOCK_WORD_INFLATED)) {
 		lw.lock_word &= ~LOCK_WORD_BITS_MASK;
@@ -427,24 +387,15 @@ mono_monitor_exit (MonoObject *obj)
  * is requested. In this case it returns -1.
  */
 static inline gint32 
-mono_monitor_try_enter_inflated (MonoObject *obj, MonoThreadsSync *mon, guint32 id, 
+mono_monitor_try_enter_inflated (MonoObject *obj, MonoThreadsSync *mon,
 											guint32 ms, gboolean allow_interruption)
 {	
-	MonoInternalThread *thread;
-	HANDLE sem;
-	guint32 then;
-	guint32 waitms;	
-	guint32 ret;
+	guint32 wait_status;
 
-	if (G_LIKELY (mon->owner == 0 && InterlockedCompareExchange (&mon->owner, id, 0) == 0)) {
+	if (st_reentrant_fair_lock_try_enter (&mon->lock)) {
 		return 1;
 	}
-	
-	if (mon->owner == id) {
-		mon->nest += 1;
-		return 1;
-	}
-	
+
 	mono_perfcounters->thread_contentions++;
 		
 	if (G_UNLIKELY (ms == 0)) {
@@ -454,114 +405,29 @@ mono_monitor_try_enter_inflated (MonoObject *obj, MonoThreadsSync *mon, guint32 
 
 	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_CONTENTION);
 	
-	/*
-	 * Create the semaphore if necessary.
-	 */
+	wait_status = st_reentrant_fair_lock_try_enter_ex (&mon->lock, ms, NULL, allow_interruption);
 
-	if (mon->entry_sem == NULL) {
-		sem = CreateSemaphore (NULL, 0, 0x7fffffff, NULL);
-		g_assert (sem != NULL);
-		if (InterlockedCompareExchangePointer ((gpointer*)&mon->entry_sem, sem, NULL) != NULL) {
-			CloseHandle (sem);
-		}
-	}
-
-	then = mono_msec_ticks ();
-
-retry:
-	if (G_LIKELY (mon->owner == 0 && InterlockedCompareExchange (&mon->owner, id, 0) == 0)) {
-		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_DONE);
+	if (wait_status == WAIT_SUCCESS) {
 		return 1;
-	} 
-	
-	/* If we need to time out, record a timestamp and adjust ms,
-		* because WaitForSingleObject doesn't tell us how long it
-		* waited for.
-		*
-		* Don't block forever here, because theres a chance the owner
-		* thread released the lock while we were creating the
-		* semaphore: we would not get the wakeup.  Using the event
-		* handle technique from pulse/wait would involve locking the
-		* lock struct and therefore slowing down the fast path.
-		*/
-
-	if (ms != INFINITE) {
-		if (ms < 100) {
-			waitms = ms;
-		} else {
-			waitms = 100;
-		}
-	} else {
-		waitms = 100;
-	}
-
-	InterlockedIncrement (&mon->entry_count);
-
-	mono_perfcounters->thread_queue_len++;
-	mono_perfcounters->thread_queue_max++;
-
-	thread = mono_thread_current ();
-		
-	mono_thread_set_state (thread, ThreadState_WaitSleepJoin);
-
-	/*
-	 * We pass TRUE instead of allow_interruption since we have to check for the
-	 * StopRequested case below.
-	 */
-		
-	ret = WaitForSingleObjectEx (mon->entry_sem, waitms, TRUE);
-
-	mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
-	
-	InterlockedDecrement (&mon->entry_count);
-		
-	mono_perfcounters->thread_queue_len--;
-
-	if (ms != INFINITE) {
-      guint32 now = mono_msec_ticks ();
-      guint32 elapsed = now == then ? 1 : now - then;
-		if (ms <= elapsed) {
-         ms = 0;
-    } else {
-         ms -= elapsed;
-		}
-
-		then = now;
-
-		if ((ret == WAIT_TIMEOUT || (ret == WAIT_IO_COMPLETION && !allow_interruption)) && ms > 0) {
-			goto retry;
-		}
-	} else {
-		if (ret == WAIT_TIMEOUT || (ret == WAIT_IO_COMPLETION && !allow_interruption)) {
-			if (ret == WAIT_IO_COMPLETION && (mono_thread_test_state (thread, (ThreadState_StopRequested|ThreadState_SuspendRequested)))) {
-				/* 
-				 * We have to obey a stop/suspend request even if 
-				 * allow_interruption is FALSE to avoid hangs at shutdown.
-				 */
-				mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_FAIL);
-				return -1;
-			}
-			/* Infinite wait, so just try again */
-			goto retry;
-		}
 	}
 	
-	if (ret == WAIT_OBJECT_0) {
-		goto retry;
-	}
-
-	/* We must have timed out */
-	LOCK_DEBUG (g_message ("%s: (%d) timed out waiting, returning FALSE", __func__, mono_thread_info_get_small_id ()));
-
 	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_FAIL);
 
-	return ret == WAIT_IO_COMPLETION ? -1 : 0;
+	if (wait_status == WAIT_TIMEOUT) {
+		LOCK_DEBUG (g_message ("%s: (%d) timed out waiting, returning FALSE", __func__, mono_thread_info_get_small_id ()));
+		return 0;
+	}
+
+	LOCK_DEBUG (g_message ("%s: (%d) was interrupted", __func__, mono_thread_info_get_small_id ()));
+	return -1;
 }
 
 static inline void
 fail_inflation (MonoObject *obj, MonoThreadsSync *mon)
 {
-	if (--mon->nest == 0) {
+	gsize nv = (gsize)mon->wait_list.flink - 1;
+	mon->wait_list.flink = (ListEntry *)nv;
+	if (nv == 0) {
 		g_hash_table_remove (monitor_table, obj);
 		mon_finalize (mon);
 	}
@@ -571,7 +437,7 @@ fail_inflation (MonoObject *obj, MonoThreadsSync *mon)
  * Returns with the monitor lock held.
  */
 static gint32 
-mono_monitor_inflate (MonoObject *obj, int id, guint32 ms, gboolean allow_interruption)
+mono_monitor_inflate (MonoObject *obj, guint32 ms, gboolean allow_interruption)
 {
 	LockWord lw;
 	MonoThreadsSync *mon;
@@ -590,11 +456,11 @@ mono_monitor_inflate (MonoObject *obj, int id, guint32 ms, gboolean allow_interr
 retry:
 	mono_monitor_allocator_lock ();		
 	if ((locked = ((mon = (MonoThreadsSync *)g_hash_table_lookup (monitor_table, obj)) == NULL))) {
-		mon = mon_new (id);
+		mon = mon_new ();
 		g_hash_table_insert (monitor_table, obj, mon); 
-		mon->nest = 1;
+		mon->wait_list.flink = (ListEntry *)1;
 	} else {
-		mon->nest += 1;
+		mon->wait_list.flink = (ListEntry *)((gsize)mon->wait_list.flink + 1);
 	}
 	mono_monitor_allocator_unlock ();
 
@@ -616,11 +482,11 @@ retry:
 			mono_monitor_allocator_unlock ();
 		}
 
-		return mono_monitor_try_enter_inflated (obj, lw.sync, id, ms, allow_interruption);
+		return mono_monitor_try_enter_inflated (obj, lw.sync, ms, allow_interruption);
 	}
 
 	if (!locked) {
-		if ((ret = mono_monitor_try_enter_inflated (obj, mon, id, ms, allow_interruption)) != 1) {
+		if ((ret = mono_monitor_try_enter_inflated (obj, mon, ms, allow_interruption)) != 1) {
 			mono_monitor_allocator_lock ();
 
 			lw.sync = obj->synchronisation;
@@ -669,7 +535,7 @@ retry:
 				 */
 
 				mono_monitor_allocator_lock ();
-				mon->nest = 0;
+				st_list_initialize (&mon->wait_list);
 				g_hash_table_remove (monitor_table, obj);
 				mono_monitor_allocator_unlock ();
 
@@ -716,13 +582,12 @@ retry:
 }
 
 static inline gboolean
-mono_monitor_inflate_owned (MonoObject *obj, int id)
+mono_monitor_inflate_owned (MonoObject *obj)
 {
 	LockWord lw;
 	guint32 nest;
-	guint32 ret;
 
-	LOCK_DEBUG (g_message("%s: (%d) Inflating lock %p owned by the current thread", __func__, id, obj));
+	LOCK_DEBUG (g_message("%s: (%d) Inflating lock %p owned by the current thread", __func__, mono_thread_info_get_small_id (), obj));
 
 	lw.sync = obj->synchronisation;
 	nest = (lw.lock_word & LOCK_WORD_NEST_MASK) >> LOCK_WORD_NEST_SHIFT;
@@ -730,24 +595,16 @@ mono_monitor_inflate_owned (MonoObject *obj, int id)
 	obj->synchronisation = 0;
 
 	/*
-	 * We must ensure that we regain ownership of the monitor.
+	 * If we can't regain ownership of the monitor, then we're shutting down.
 	 */
 	
-	while ((ret = mono_monitor_inflate (obj, id, INFINITE, FALSE)) == -1) {
-		if (mono_threads_is_shutting_down ()) {
-			return FALSE;
-		}
+	if (mono_monitor_inflate (obj, INFINITE, FALSE) == -1) {
+		return FALSE;
 	}
 
 	lw.sync = obj->synchronisation;
 	lw.lock_word &= ~LOCK_WORD_BITS_MASK;
-	lw.sync->nest = nest;
-
-	LOCK_DEBUG (g_message("%s: (%d) Regained ownership of lock %p (%d)", __func__, mono_thread_info_get_small_id (), obj, lw.sync->owner));
-
-	if (ret == -1) {
-		mono_thread_interruption_checkpoint ();
-	}
+	lw.sync->lock.nest = nest;
 
 	return TRUE;
 }
@@ -777,10 +634,10 @@ mono_monitor_try_enter_internal (MonoObject *obj, guint32 ms, gboolean allow_int
 		lw.sync = obj->synchronisation;
 	} else if ((lw.lock_word & LOCK_WORD_BITS_MASK) == 0 && ((unsigned int)lw.lock_word >> LOCK_WORD_OWNER_SHIFT) == id) {
 		if ((lw.lock_word & LOCK_WORD_NEST_MASK) == LOCK_WORD_NEST_MASK) {
-			mono_monitor_inflate_owned (obj, id);
+			mono_monitor_inflate_owned (obj);
 			lw.sync = obj->synchronisation;
 			lw.lock_word &= ~LOCK_WORD_BITS_MASK;
-			lw.sync->nest += 1;
+			lw.sync->lock.nest += 1;
 		} else {
 			lw.lock_word += 1 << LOCK_WORD_NEST_SHIFT;
 			obj->synchronisation = lw.sync;
@@ -790,7 +647,7 @@ mono_monitor_try_enter_internal (MonoObject *obj, guint32 ms, gboolean allow_int
 
 	if (lw.lock_word & LOCK_WORD_INFLATED) {
 		lw.lock_word &= ~LOCK_WORD_BITS_MASK;
-		return mono_monitor_try_enter_inflated (obj, lw.sync, id, ms, allow_interruption);
+		return mono_monitor_try_enter_inflated (obj, lw.sync, ms, allow_interruption);
 	}
 
 	/*
@@ -798,7 +655,7 @@ mono_monitor_try_enter_internal (MonoObject *obj, guint32 ms, gboolean allow_int
 	 * code. Either way, inflate the monitor.
 	 */
 
-	return mono_monitor_inflate (obj, id, ms, allow_interruption);
+	return mono_monitor_inflate (obj, ms, allow_interruption);
 }
 
 gboolean 
@@ -887,20 +744,13 @@ mono_object_hash (MonoObject* obj)
 		 */
 
 		gboolean locked;
-		int id = mono_thread_info_get_small_id ();
-
-		if ((locked = ((unsigned int)lw.lock_word >> LOCK_WORD_OWNER_SHIFT) == id)) {
-			if (!mono_monitor_inflate_owned (obj, id)) {
+		
+		if ((locked = ((unsigned int)lw.lock_word >> LOCK_WORD_OWNER_SHIFT) == mono_thread_info_get_small_id ())) {
+			if (!mono_monitor_inflate_owned (obj)) {
 				return 0;
 			}
-		} else {
-			while (mono_monitor_inflate (obj, id, INFINITE, FALSE) == -1) {
-				/* 
-				 * FIXME: Don't raise a ThreadInterruptedException ?
-				 */
-				 
-				mono_thread_interruption_checkpoint ();
-			}
+		} else if (mono_monitor_inflate (obj, INFINITE, FALSE) == -1) {
+			return 0;
 		}
 
 		lw.sync = obj->synchronisation;
@@ -1355,22 +1205,21 @@ ves_icall_System_Threading_Monitor_Monitor_try_enter_with_atomic_var (MonoObject
 }
 
 /* 
- * All wait list manipulation in the pulse, pulseall and wait
- * functions happens while the monitor lock is held, so we don't need
- * any extra struct locking
+ * The pulse and wait functions are called with the lock held by the current thread.
  */
+
 void
 ves_icall_System_Threading_Monitor_Monitor_pulse (MonoObject *obj)
 {
-	int id;
 	LockWord lw;
+	ListEntry *head, *entry;
+   WaitBlock *wait_block;
 	
 	LOCK_DEBUG (g_message ("%s: (%d) Pulsing %p", __func__, mono_thread_info_get_small_id (), obj));
 	
-	id = mono_thread_info_get_small_id ();
 	lw.sync = obj->synchronisation;
 
-	mono_monitor_ensure_synchronized (lw, id);
+	mono_monitor_ensure_synchronized (lw);
 
 	if ((lw.lock_word & LOCK_WORD_INFLATED) == 0) {
 		
@@ -1379,34 +1228,41 @@ ves_icall_System_Threading_Monitor_Monitor_pulse (MonoObject *obj)
 		 * inflate the monitor.
 		 */
 
-		mono_monitor_inflate_owned (obj, id);
+		mono_monitor_inflate_owned (obj);
 		lw.sync = obj->synchronisation;
 	}
 
 	lw.lock_word &= ~LOCK_WORD_BITS_MASK;
-	
-	LOCK_DEBUG (g_message ("%s: (%d) %d threads waiting", __func__, mono_thread_info_get_small_id (), g_slist_length (lw.sync->wait_list)));
-	
-	if (lw.sync->wait_list != NULL) {
-		LOCK_DEBUG (g_message ("%s: (%d) signalling and dequeuing handle %p", __func__, mono_thread_info_get_small_id (), lw.sync->wait_list->data));
-	
-		SetEvent (lw.sync->wait_list->data);
-		lw.sync->wait_list = g_slist_remove (lw.sync->wait_list, lw.sync->wait_list->data);
+
+	head = &lw.sync->wait_list;
+   if ((entry = head->flink) != head) {
+		do {	
+			st_list_remove_entry (entry);
+			wait_block = CONTAINING_RECORD (entry, WaitBlock, wait_list_entry);
+        
+			if (st_parker_try_lock (wait_block->parker)) {
+				st_reentrant_fair_lock_enqueue_locked (&lw.sync->lock, wait_block);
+				LOCK_DEBUG (g_message ("%s: (%d) Moving a thread from the condition the lock's queue", __func__, mono_thread_info_get_small_id ()));
+				break;
+			}
+			
+			entry->flink = entry;			
+		} while ((entry = head->flink) != head);
 	}
 }
 
 void
 ves_icall_System_Threading_Monitor_Monitor_pulse_all (MonoObject *obj)
 {
-	int id;
 	LockWord lw;
-	
+	ListEntry *head, *entry, *next;
+   WaitBlock *wait_block;
+
 	LOCK_DEBUG (g_message("%s: (%d) Pulsing all %p", __func__, mono_thread_info_get_small_id (), obj));
 
-	id = mono_thread_info_get_small_id ();
 	lw.sync = obj->synchronisation;
 
-	mono_monitor_ensure_synchronized (lw, id);
+	mono_monitor_ensure_synchronized (lw);
 
 	if ((lw.lock_word & LOCK_WORD_INFLATED) == 0) {
 		
@@ -1415,135 +1271,84 @@ ves_icall_System_Threading_Monitor_Monitor_pulse_all (MonoObject *obj)
 		 * inflate the monitor.
 		 */
 
-		mono_monitor_inflate_owned (obj, id);
+		mono_monitor_inflate_owned (obj);
 		lw.sync = obj->synchronisation;
 	}
 	
 	lw.lock_word &= ~LOCK_WORD_BITS_MASK;
 
-	LOCK_DEBUG (g_message ("%s: (%d) %d threads waiting", __func__, mono_thread_info_get_small_id (), g_slist_length (lw.sync->wait_list)));
+	head = &lw.sync->wait_list;
+   if ((entry = head->flink) != head) {
+		do {	
+			next = entry->flink;
+			wait_block = CONTAINING_RECORD (entry, WaitBlock, wait_list_entry);
+        
+			if (st_parker_try_lock (wait_block->parker)) {
+				st_reentrant_fair_lock_enqueue_locked (&lw.sync->lock, wait_block);
+				LOCK_DEBUG (g_message ("%s: (%d) Moving a thread from the condition the lock's queue", __func__, mono_thread_info_get_small_id ()));
+			} else {			
+				entry->flink = entry;			
+			}
+		} while ((entry = next) != head);
 
-	while (lw.sync->wait_list != NULL) {
-		LOCK_DEBUG (g_message ("%s: (%d) signalling and dequeuing handle %p", __func__, mono_thread_info_get_small_id (), lw.sync->wait_list->data));
-	
-		SetEvent (lw.sync->wait_list->data);
-		lw.sync->wait_list = g_slist_remove (lw.sync->wait_list, lw.sync->wait_list->data);
+		st_list_initialize (head);
 	}
 }
 
 gboolean
 ves_icall_System_Threading_Monitor_Monitor_wait (MonoObject *obj, guint32 ms)
 {
-	MonoInternalThread *thread;
-	int id;
 	LockWord lw;
-	HANDLE event;
-	guint32 nest;
-	guint32 ret;
+	gint32 res;
+	StParker parker; 
+   WaitBlock wait_block;
+   guint32 lock_state;
+   guint32 wait_status;
+	SpinWait spinner;
 
 	LOCK_DEBUG (g_message ("%s: (%d) Trying to wait for %p with timeout %dms", __func__, mono_thread_info_get_small_id (), obj, ms));
 	
-	id = mono_thread_info_get_small_id ();
 	lw.sync = obj->synchronisation;
 
-	mono_monitor_ensure_synchronized (lw, id);
+	mono_monitor_ensure_synchronized (lw);
 
 	if ((lw.lock_word & LOCK_WORD_INFLATED) == 0) {
-		mono_monitor_inflate_owned (obj, id);
+		mono_monitor_inflate_owned (obj);
 		lw.sync = obj->synchronisation;
 	}
 
 	lw.lock_word &= ~LOCK_WORD_BITS_MASK;
 
-	/* Do this WaitSleepJoin check before creating the event handle */
-	mono_thread_current_check_pending_interrupt ();
-	
-	event = CreateEvent (NULL, FALSE, FALSE, NULL);
-	if (event == NULL) {
-		mono_raise_exception (mono_get_exception_synchronization_lock ("Failed to set up wait event"));
-		return FALSE;
-	}
-	
-	LOCK_DEBUG (g_message ("%s: (%d) queuing handle %p", __func__, mono_thread_info_get_small_id (), event));
-	
-	thread = mono_thread_internal_current ();
+	st_parker_init (&parker, 1);
+	st_wait_block_init (&wait_block, &parker, 0, WAIT_SUCCESS);
 
-	mono_thread_set_state (thread, ThreadState_WaitSleepJoin);
+	st_list_insert_tail (&lw.sync->wait_list, &wait_block.wait_list_entry);
+	lock_state = st_reentrant_fair_lock_exit_completly (&lw.sync->lock);	
+	wait_status = st_parker_park_ex (&parker, MONITOR_SPIN_COUNT, ms, NULL, TRUE);
 
-	lw.sync->wait_list = g_slist_append (lw.sync->wait_list, event);
-	
-	/* Save the nest count, and release the lock */
-	nest = lw.sync->nest;
-	lw.sync->nest = 0;
-	mono_monitor_exit_inflated (obj, lw.sync);
-
-	LOCK_DEBUG (g_message ("%s: (%d) Unlocked %p lock %p", __func__, mono_thread_info_get_small_id (), obj, lw.sync));
-
-	/* There's no race between unlocking the monitor and waiting for 
-	 * the event, because auto reset events are sticky, and this event
-	 * is private to this thread.  Therefore even if the event was
-	 * signalled before we wait, we still succeed.
-	 */
-	
-	ret = WaitForSingleObjectEx (event, ms, TRUE);
-
-	/* Reset the thread state fairly early, so we don't have to worry
-	 * about the monitor error checking
-	 */
-	mono_thread_clr_state (thread, ThreadState_WaitSleepJoin);
-	
-	/* Regain the lock with the previous nest count */
-	
-	while (mono_monitor_try_enter_inflated (obj, lw.sync, id, INFINITE, FALSE) == -1) {
-		ret = -1;
-		if (mono_threads_is_shutting_down ()) {
-			mono_thread_interruption_checkpoint ();
-			return ret;
-		}
-	}
-
-	lw.sync->nest = nest;
-
-	LOCK_DEBUG (g_message ("%s: (%d) Regained %p lock %p", __func__, mono_thread_info_get_small_id (), obj, lw.sync));
-
-	if (ret == WAIT_TIMEOUT) {
-		/* 
-		 * Poll the event again, just in case it was signalled
-		 * while we were trying to regain the monitor lock
-		 */
-		ret = WaitForSingleObjectEx (event, 0, FALSE);
-	}
-
-	/* 
-	 * Pulse will have popped our event from the queue if it signalled
-	 * us, so we only do it here if the wait timed out.
-	 *
-	 * This avoids a race condition where the thread holding the
-	 * lock can Pulse several times before the WaitForSingleObject
-	 * returns.  If we popped the queue here then this event might
-	 * be signalled more than once, thereby starving another
-	 * thread.
-	 */
-	
-	if (ret == WAIT_OBJECT_0) {
-		LOCK_DEBUG (g_message ("%s: (%d) Success", __func__, mono_thread_info_get_small_id ()));
-		CloseHandle (event);
-		return 1;
-	}
-	
-	LOCK_DEBUG (g_message ("%s: (%d) Wait failed, dequeuing handle %p", __func__, mono_thread_info_get_small_id (), event));
-	
 	/*
-	 * No pulse, so we have to remove ourself from the wait queue.
+	 * If the wait failed, we must acquire the lock. Even if we're shutting down, we
+	 * must ensure that we remove our wait block to avoid invalid accesses. Fix this.
 	 */
 
-	lw.sync->wait_list = g_slist_remove (lw.sync->wait_list, event);
-	CloseHandle (event);
+	if (wait_status != WAIT_SUCCESS) {
+		LOCK_DEBUG (g_message ("%s: (%d) Wait failed, reacquiring the lock", __func__, mono_thread_info_get_small_id ()));
+		res = wait_status == WAIT_TIMEOUT ? 0 : -1;
+      do {
+			if (st_reentrant_fair_lock_enter (&lw.sync->lock)) {
+            break;
+         }
+			st_spin_once (&spinner);
+      } while (TRUE);
+   } else {
+		LOCK_DEBUG (g_message ("%s: (%d) Success", __func__, mono_thread_info_get_small_id ()));
 
-	if (ret == -1) {
-		mono_thread_interruption_checkpoint ();
-	}
+		res = 1;
+      lw.sync->lock.owner = mono_thread_info_get_small_id ();
+   }
+
+	lw.sync->lock.nest = lock_state;
 	
-	return 0;
+	return res;
 }
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    

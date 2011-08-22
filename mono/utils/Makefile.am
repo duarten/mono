@@ -104,7 +104,11 @@ monoutils_sources = \
 	st-alerter.c \
 	st-ds.h	\
 	st-lock.c	\
+	st-locked-queue.c \
+	st-mutant.c \
+	st-notification-event.c \
 	st-parker.c	\
+	st-reentrant-fair-lock.c \
 	st-spinwait.c
 
 arch_sources = 

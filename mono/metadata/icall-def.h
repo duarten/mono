@@ -862,7 +862,7 @@ ICALL(ST_3, "RegisterHandle_internal(StWaitable)", ves_icall_System_Threading_St
 ICALL(ST_4, "RemoveHandle_internal(intptr)", ves_icall_System_Threading_StInternalMethods_RemoveHandle_internal)
 ICALL(ST_5, "ResolveHandle_internal(intptr)", ves_icall_System_Threading_StInternalMethods_ResolveHandle_internal)
 ICALL(ST_6, "Set_internal(intptr)", ves_icall_System_Threading_StInternalMethods_Set_internal)
-ICALL(ST_7, "WaitForParkSpot_internal(intptr,int,bool)", ves_icall_System_Threading_StInternalMethods_WaitForParkSpot_internal)
+ICALL(ST_7, "WaitForParkSpot_internal(intptr,int)", ves_icall_System_Threading_StInternalMethods_WaitForParkSpot_internal)
 ICALL(ST_8, "WaitMultiple_internal(intptr,SafeWaitHandle[],bool,int)", ves_icall_System_Threading_StInternalMethods_WaitMultiple_internal)
 ICALL(ST_9, "Wait_internal(intptr,int)", ves_icall_System_Threading_StInternalMethods_Wait_internal)
 

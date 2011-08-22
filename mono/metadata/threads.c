@@ -5,7 +5,6 @@
  *	Dick Porter (dick@ximian.com)
  *	Paolo Molaro (lupus@ximian.com)
  *	Patrik Torstensson (patrik.torstensson@labs2.com)
- *	Duarte Nunes (duarte.m.nunes@gmail.com)
  *
  * Copyright 2001-2003 Ximian, Inc (http://www.ximian.com)
  * Copyright 2004-2009 Novell, Inc (http://www.novell.com)
@@ -417,7 +416,7 @@ static void thread_cleanup (MonoInternalThread *thread)
 	ref_stack_destroy (thread->appdomain_refs);
 	thread->appdomain_refs = NULL;
 
-	cleanup_park_spot_list ((ParkSpot *) &thread->free_park_spot_list);
+	cleanup_park_spot_list ((ParkSpot *) thread->free_park_spot_list);
 
 	if (mono_thread_cleanup_fn)
 		mono_thread_cleanup_fn (thread);
@@ -4656,7 +4655,7 @@ ves_icall_System_Threading_StInternalMethods_Alloc_internal (ParkSpot **ps)
    if ((park_spot = (ParkSpot *) thread->free_park_spot_list) != NULL) {
       thread->free_park_spot_list = park_spot->next;
    } else {
-		park_spot = (ParkSpot *) g_malloc0 (sizeof (*ps));
+		park_spot = (ParkSpot *) g_malloc0 (sizeof (*park_spot));
 		park_spot->thread = thread;
 		MONO_SEM_INIT (&park_spot->handle, 0);
    }
@@ -4724,9 +4723,9 @@ managed_wait_epilogue (MonoInternalThread *thread)
  * Waits for multiple Win32 system objects. Right now this is only used for wait any.
  */
 
-guint32
+gint32
 ves_icall_System_Threading_StInternalMethods_WaitMultiple_internal (ParkSpot *ps, MonoArray *safe_handles, 
-																						  gboolean waitAll, gint32 timeout)
+																						  MonoBoolean waitAll, gint32 timeout)
 {	
 #ifdef HOST_WIN32
 	HANDLE handles [MAXIMUM_WAIT_OBJECTS];
@@ -4843,8 +4842,8 @@ wait_for_park_spot (ParkSpot *ps, guint32 timeout, gboolean interruptible, gbool
       if (errno != EINTR) {
          return res == 0;
       } else if (managed || interruptible || shutting_down) {
-				THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Wait failed", __func__, GetCurrentThreadId ()));			
-				return -1;
+			THREAD_WAIT_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Wait failed", __func__, GetCurrentThreadId ()));			
+			return -1;
 		}
 
       if (ps->state == 0 && timeout != INFINITE) {

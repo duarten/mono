@@ -34,7 +34,7 @@ void ves_icall_System_Threading_StInternalMethods_Free_internal (ParkSpot *ps) M
 void ves_icall_System_Threading_StInternalMethods_Set_internal (ParkSpot *ps) MONO_INTERNAL;
 gboolean ves_icall_System_Threading_StInternalMethods_WaitForParkSpot_internal (ParkSpot *ps, gint32 timeout) MONO_INTERNAL;
 gboolean ves_icall_System_Threading_StInternalMethods_Wait_internal (HANDLE handle, gint32 timeout) MONO_INTERNAL;
-guint32 ves_icall_System_Threading_StInternalMethods_WaitMultiple_internal (ParkSpot *ps, MonoArray *safe_handles, gboolean waitAll, gint32 timeout) MONO_INTERNAL;
+gint32 ves_icall_System_Threading_StInternalMethods_WaitMultiple_internal (ParkSpot *ps, MonoArray *safe_handles, MonoBoolean waitAll, gint32 timeout) MONO_INTERNAL;
 
 guint32 wait_for_park_spot (ParkSpot *ps, guint32 timeout, gboolean interruptible, gboolean managed) MONO_INTERNAL;
 

@@ -63,7 +63,7 @@ namespace System.Threading
        */
 
 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
-		internal static extern IntPtr RegisterHandle_internal (StWaitable waitble);
+		internal static extern IntPtr RegisterHandle_internal (object waitable);
 
 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
 		internal static extern StWaitable ResolveHandle_internal (IntPtr handle);

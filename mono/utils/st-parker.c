@@ -10,9 +10,11 @@
 #include <mono/utils/mono-memory-model.h>
 
 guint32 
-st_parker_park_ex (StParker *parker, gint32 spin_count, gint32 timeout, StAlerter *alerter)
+st_parker_park_ex (StParker *parker, guint32 spin_count, gint32 timeout, 
+						 StAlerter *alerter, gboolean interruptible)
 {
 	gboolean registered;
+	guint32 wait_status;
 
 	do {
 		if (parker->state >= 0) {
@@ -54,11 +56,11 @@ st_parker_park_ex (StParker *parker, gint32 spin_count, gint32 timeout, StAlerte
 		timeout = INFINITE;
    }
 
-	if (wait_for_park_spot (parker->ps, timeout, TRUE, FALSE) != 1) {
+	if ((wait_status = wait_for_park_spot (parker->ps, timeout, interruptible, FALSE)) != 1) {
       if (st_parker_try_cancel (parker)) {
-         st_parker_unpark_self (parker, WAIT_TIMEOUT);
-      } else {
-         wait_for_park_spot (parker->ps, INFINITE, FALSE, FALSE);
+         st_parker_unpark_self (parker, wait_status == 0 ? WAIT_TIMEOUT : WAIT_INTERRUPTED);
+      } else if (wait_for_park_spot (parker->ps, INFINITE, FALSE, FALSE) != 1) {
+			st_parker_unpark_self (parker, WAIT_INTERRUPTED);
       }
    }
    
