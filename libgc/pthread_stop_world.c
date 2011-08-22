@@ -461,6 +461,7 @@ static void pthread_stop_world()
 #else /* NACL */
     GC_thread p;
     int i;
+    int num_sleeps = 0;
 
     #if DEBUG_THREADS
     GC_printf1("pthread_stop_world: num_threads %d\n", nacl_num_gc_threads - 1);
@@ -470,6 +471,7 @@ static void pthread_stop_world()
     
     while (1) {
 	#define NACL_PARK_WAIT_NANOSECONDS 100000
+        #define NANOS_PER_SECOND 1000000000
         int num_threads_parked = 0;
         struct timespec ts;
         int num_used = 0;
@@ -491,6 +493,10 @@ static void pthread_stop_world()
         GC_printf1("sleeping waiting for %d threads to park...\n", nacl_num_gc_threads - num_threads_parked - 1);
         #endif
         nanosleep(&ts, 0);
+        if (++num_sleeps > NANOS_PER_SECOND / NACL_PARK_WAIT_NANOSECONDS) {
+            GC_printf1("GC appears stalled waiting for %d threads to park...\n", nacl_num_gc_threads - num_threads_parked - 1);
+            num_sleeps = 0;
+        }
     }
 
 #endif /* NACL */
@@ -674,10 +680,14 @@ static void pthread_start_world()
       GC_printf0("World started\n");
     #endif
 #else /* NACL */
+    if (GC_notify_event)
+        GC_notify_event (GC_EVENT_PRE_START_WORLD);
 #   if DEBUG_THREADS
     GC_printf0("World starting\n");
 #   endif
     nacl_park_threads_now = 0;
+    if (GC_notify_event)
+        GC_notify_event (GC_EVENT_POST_START_WORLD);
 #endif /* NACL */
 }
 

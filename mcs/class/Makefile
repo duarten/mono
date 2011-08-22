@@ -157,7 +157,8 @@ mobile_dirs := \
 	System.Transactions	\
 	System.Data	\
 	Mono.Cairo	\
-	Mono.Data.Sqlite
+	Mono.Data.Sqlite	\
+	System.Data.Services.Client
 
 net_3_5_only_dirs := \
 	Microsoft.Build.Framework	\
@@ -184,7 +185,8 @@ net_4_0_dirs := \
 	Microsoft.Web.Infrastructure \
 	WebMatrix.Data \
 	System.Data.Services.Client	\
-	System.Data.Services
+	System.Data.Services	\
+	System.Json
 
 net_2_0_SUBDIRS := $(common_dirs) $(net_2_0_dirs) $(net_2_0_only_dirs) aot-compiler
 moonlight_raw_SUBDIRS := $(moonlight_raw_dirs)

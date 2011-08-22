@@ -6,6 +6,8 @@
  *   Zoltan Varga (vargaz@gmail.com)
  *
  * (C) 2002 Ximian, Inc.
+ * Copyright 2003-2011 Novell, Inc.
+ * Copyright 2011 Xamarin, Inc.
  */
 
 #include "config.h"
@@ -2529,7 +2531,7 @@ load_method (MonoDomain *domain, MonoAotModule *amodule, MonoImage *image, MonoM
 
 	mono_aot_lock ();
 	if (!amodule->methods_loaded)
-		amodule->methods_loaded = g_new0 (guint32, amodule->info.nmethods + 1);
+		amodule->methods_loaded = g_new0 (guint32, amodule->info.nmethods / 32 + 1);
 	mono_aot_unlock ();
 
 	if ((amodule->methods_loaded [method_index / 32] >> (method_index % 32)) & 0x1)
@@ -2924,15 +2926,15 @@ mono_aot_get_method (MonoDomain *domain, MonoMethod *method)
 				return code;
 		}
 
-		/* Same for CompareExchange<T> */
-		if (method_index == 0xffffff && method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE && method->klass->image == mono_defaults.corlib && !strcmp (method->klass->name_space, "System.Threading") && !strcmp (method->klass->name, "Interlocked") && !strcmp (method->name, "CompareExchange") && MONO_TYPE_IS_REFERENCE (mono_method_signature (method)->params [1])) {
+		/* Same for CompareExchange<T> and Exchange<T> */
+		if (method_index == 0xffffff && method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE && method->klass->image == mono_defaults.corlib && !strcmp (method->klass->name_space, "System.Threading") && !strcmp (method->klass->name, "Interlocked") && (!strcmp (method->name, "CompareExchange") || !strcmp (method->name, "Exchange")) && MONO_TYPE_IS_REFERENCE (mono_method_signature (method)->params [1])) {
 			MonoMethod *m;
 			MonoGenericContext ctx;
 			MonoType *args [16];
 			gpointer iter = NULL;
 
 			while ((m = mono_class_get_methods (method->klass, &iter))) {
-				if (mono_method_signature (m)->generic_param_count && !strcmp (m->name, "CompareExchange"))
+				if (mono_method_signature (m)->generic_param_count && !strcmp (m->name, method->name))
 					break;
 			}
 			g_assert (m);
@@ -3534,7 +3536,7 @@ mono_aot_get_unbox_trampoline (MonoMethod *method)
 		guint32 index = find_extra_method (method, &amodule);
 		g_assert (index != 0xffffff);
 		
-		symbol = g_strdup_printf ("ut_e_%d", index);
+		symbol = g_strdup_printf ("ut_%d", index);
 	} else {
 		amodule = method->klass->image->aot_module;
 		g_assert (amodule);

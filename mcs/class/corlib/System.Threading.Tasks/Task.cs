@@ -70,6 +70,9 @@ namespace System.Threading.Tasks
 
 		CancellationToken token;
 
+		const TaskCreationOptions MaxTaskCreationOptions =
+			TaskCreationOptions.PreferFairness | TaskCreationOptions.LongRunning | TaskCreationOptions.AttachedToParent;
+
 		public Task (Action action) : this (action, TaskCreationOptions.None)
 		{
 			
@@ -86,8 +89,12 @@ namespace System.Threading.Tasks
 		}
 		
 		public Task (Action action, CancellationToken cancellationToken, TaskCreationOptions creationOptions)
-			: this (null, null, cancellationToken, creationOptions)
+			: this (null, null, cancellationToken, creationOptions, current)
 		{
+			if (action == null)
+				throw new ArgumentNullException ("action");
+			if (creationOptions > MaxTaskCreationOptions || creationOptions < TaskCreationOptions.None)
+				throw new ArgumentOutOfRangeException ("creationOptions");
 			this.simpleAction = action;
 		}
 		
@@ -108,7 +115,10 @@ namespace System.Threading.Tasks
 		public Task (Action<object> action, object state, CancellationToken cancellationToken, TaskCreationOptions creationOptions)
 			: this (action, state, cancellationToken, creationOptions, current)
 		{
-
+			if (action == null)
+				throw new ArgumentNullException ("action");
+			if (creationOptions > MaxTaskCreationOptions || creationOptions < TaskCreationOptions.None)
+				throw new ArgumentOutOfRangeException ("creationOptions");
 		}
 
 		internal Task (Action<object> action,
@@ -121,7 +131,7 @@ namespace System.Threading.Tasks
 			this.action              = action;
 			this.state               = state;
 			this.taskId              = Interlocked.Increment (ref id);
-			this.status              = TaskStatus.Created;
+			this.status              = cancellationToken.IsCancellationRequested ? TaskStatus.Canceled : TaskStatus.Created;
 			this.token               = cancellationToken;
 			this.parent              = parent;
 
@@ -149,6 +159,8 @@ namespace System.Threading.Tasks
 		
 		public void Start (TaskScheduler scheduler)
 		{
+			if (status >= TaskStatus.WaitingToRun)
+				throw new InvalidOperationException ("The Task is not in a valid state to be started.");
 			SetupScheduler (scheduler);
 			Schedule ();
 		}
@@ -255,7 +267,7 @@ namespace System.Threading.Tasks
 		
 		internal void ContinueWithCore (Task continuation, TaskContinuationOptions continuationOptions, TaskScheduler scheduler)
 		{
-			ContinueWithCore (continuation, continuationOptions, scheduler, () => true);
+			ContinueWithCore (continuation, continuationOptions, scheduler, null);
 		}
 		
 		internal void ContinueWithCore (Task continuation, TaskContinuationOptions kind,
@@ -269,7 +281,7 @@ namespace System.Threading.Tasks
 			AtomicBoolean launched = new AtomicBoolean ();
 			EventHandler action = delegate (object sender, EventArgs e) {
 				if (launched.TryRelaxedSet ()) {
-					if (!predicate ())
+					if (predicate != null && !predicate ())
 						return;
 
 					if (!ContinuationStatusCheck (kind)) {
@@ -775,6 +787,9 @@ namespace System.Threading.Tasks
 		
 		protected virtual void Dispose (bool disposing)
 		{
+			if (!IsCompleted)
+				throw new InvalidOperationException ("A task may only be disposed if it is in a completion state");
+
 			// Set action to null so that the GC can collect the delegate and thus
 			// any big object references that the user might have captured in a anonymous method
 			if (disposing) {

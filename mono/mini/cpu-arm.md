@@ -1,3 +1,5 @@
+# Copyright 2003-2011 Novell, Inc (http://www.novell.com)
+# Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
 # arm cpu description file
 # this file is read by genmdesc to pruduce a table with all the relevant information
 # about the cpu instructions that may be used by the regsiter allocator, the scheduler
@@ -91,7 +93,7 @@ vcall: len:20 clob:c
 vcall_reg: src1:i len:8 clob:c
 vcall_membase: src1:b len:12 clob:c
 iconst: dest:i len:16
-r4const: dest:f len:20
+r4const: dest:f len:24
 r8const: dest:f len:20
 label: len:0
 store_membase_imm: dest:b len:20

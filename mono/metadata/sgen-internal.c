@@ -20,6 +20,9 @@
  * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+
+#include "config.h"
+
 #ifdef HAVE_SGEN_GC
 
 #include "utils/mono-counters.h"
@@ -67,12 +70,14 @@ mono_sgen_register_fixed_internal_mem_type (int type, size_t size)
 	int slot;
 
 	g_assert (type >= 0 && type < INTERNAL_MEM_MAX);
-	g_assert (fixed_type_allocator_indexes [type] == -1);
 
 	slot = index_for_size (size);
 	g_assert (slot >= 0);
 
-	fixed_type_allocator_indexes [type] = slot;
+	if (fixed_type_allocator_indexes [type] == -1)
+		fixed_type_allocator_indexes [type] = slot;
+	else
+		g_assert (fixed_type_allocator_indexes [type] == slot);
 }
 
 void*
@@ -137,7 +142,7 @@ mono_sgen_dump_internal_mem_usage (FILE *heap_dump_file)
 {
 	/*
 	static char const *internal_mem_names [] = { "pin-queue", "fragment", "section", "scan-starts",
-						     "fin-table", "finalize-entry", "dislink-table",
+						     "fin-table", "finalize-entry", "finalize-ready-entry", "dislink-table",
 						     "dislink", "roots-table", "root-record", "statistics",
 						     "remset", "gray-queue", "store-remset", "marksweep-tables",
 						     "marksweep-block-info", "ephemeron-link", "worker-data",

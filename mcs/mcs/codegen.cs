@@ -51,16 +51,6 @@ namespace Mono.CSharp
 		/// </summary>
 		public LocalBuilder return_value;
 
-		/// <summary>
-		///   The location where return has to jump to return the
-		///   value
-		/// </summary>
-		public Label ReturnLabel;
-
-		/// <summary>
-		///   If we already defined the ReturnLabel
-		/// </summary>
-		public bool HasReturnLabel;
 
 		/// <summary>
 		///   Current loop begin and end labels.
@@ -87,14 +77,16 @@ namespace Mono.CSharp
 
 		DynamicSiteClass dynamic_site_container;
 
-		TypeSpec[] stack_types;
+		Label? return_label;
 
 		public EmitContext (IMemberContext rc, ILGenerator ig, TypeSpec return_type)
 		{
 			this.member_context = rc;
 			this.ig = ig;
-
 			this.return_type = return_type;
+
+			if (rc.Module.Compiler.Settings.Checked)
+				flags |= Options.CheckedScope;
 
 #if STATIC
 			ig.__CleverExceptionBlockAssistance ();
@@ -102,6 +94,12 @@ namespace Mono.CSharp
 		}
 
 		#region Properties
+
+		internal AsyncTaskStorey AsyncTaskStorey {
+			get {
+				return CurrentAnonymousMethod.Storey as AsyncTaskStorey;
+			}
+		}
 
 		public BuiltinTypes BuiltinTypes {
 			get {
@@ -119,6 +117,12 @@ namespace Mono.CSharp
 
 		public MemberCore CurrentTypeDefinition {
 			get { return member_context.CurrentMemberDefinition; }
+		}
+
+		public bool HasReturnLabel {
+			get {
+				return return_label.HasValue;
+			}
 		}
 
 		public bool IsStatic {
@@ -159,26 +163,25 @@ namespace Mono.CSharp
 			}
 		}
 
-		public int StackHeight {
-			get {
-#if STATIC
-				return ig.__StackHeight;
-#else
-				throw new NotImplementedException ();
-#endif
-			}
-		}
-
 		//
-		// Enabled when tracking stack types during emit phase
+		// The label where we have to jump before leaving the context
 		//
-		bool TrackStackTypes {
+		public Label ReturnLabel {
 			get {
-				return (flags & Options.AsyncBody) != 0;
+				return return_label.Value;
 			}
 		}
 
 		#endregion
+
+		public void AssertEmptyStack ()
+		{
+#if STATIC
+			if (ig.__StackHeight != 0)
+				throw new InternalErrorException ("Await yields with non-empty stack in `{0}",
+					member_context.GetSignatureForError ());
+#endif
+		}
 
 		/// <summary>
 		///   This is called immediately before emitting an IL opcode to tell the symbol
@@ -250,6 +253,14 @@ namespace Mono.CSharp
 			return dynamic_site_container;
 		}
 
+		public Label CreateReturnLabel ()
+		{
+			if (!return_label.HasValue)
+				return_label = DefineLabel ();
+
+			return return_label.Value;
+		}
+
 		public LocalBuilder DeclareLocal (TypeSpec type, bool pinned)
 		{
 			if (IsAnonymousStoreyMutateRequired)
@@ -263,6 +274,17 @@ namespace Mono.CSharp
 			return ig.DefineLabel ();
 		}
 
+		//
+		// Creates temporary field in current async storey
+		//
+		public FieldExpr GetTemporaryField (TypeSpec type)
+		{
+			var f = AsyncTaskStorey.AddCapturedLocalVariable (type);
+			var fexpr = new FieldExpr (f, Location.Null);
+			fexpr.InstanceExpression = new CompilerGeneratedThis (CurrentType, Location.Null);
+			return fexpr;
+		}
+
 		public void MarkLabel (Label label)
 		{
 			ig.MarkLabel (label);
@@ -271,88 +293,26 @@ namespace Mono.CSharp
 		public void Emit (OpCode opcode)
 		{
 			ig.Emit (opcode);
-
-			if (TrackStackTypes) {
-				switch (opcode.StackBehaviourPush) {
-				case StackBehaviour.Push0:
-					// Nothing
-					break;
-				case StackBehaviour.Pushi:
-					SetStackType (Module.Compiler.BuiltinTypes.Int);
-					break;
-				case StackBehaviour.Pushi8:
-					SetStackType (Module.Compiler.BuiltinTypes.Long);
-					break;
-				case StackBehaviour.Pushr4:
-					SetStackType (Module.Compiler.BuiltinTypes.Float);
-					break;
-				case StackBehaviour.Pushr8:
-					SetStackType (Module.Compiler.BuiltinTypes.Double);
-					break;
-				case StackBehaviour.Push1:
-					if (opcode.StackBehaviourPop == StackBehaviour.Pop1) {
-						// nothing
-					} else if (opcode.StackBehaviourPop == StackBehaviour.Pop1_pop1) {
-						// nothing
-					} else {
-						throw new NotImplementedException (opcode.Name);
-					}
-					break;
-				case StackBehaviour.Push1_push1:
-					if (opcode.StackBehaviourPop == StackBehaviour.Pop1) {
-						SetStackType (stack_types[StackHeight - 2]);
-					} else {
-						throw new NotImplementedException (opcode.Name);
-					}
-					break;
-				default:
-					throw new NotImplementedException (opcode.Name);
-				}
-			}
 		}
 
-		public void Emit (OpCode opcode, LocalBuilder local, TypeSpec type)
+		public void Emit (OpCode opcode, LocalBuilder local)
 		{
 			ig.Emit (opcode, local);
-
-			if (TrackStackTypes) {
-				if (opcode.StackBehaviourPush == StackBehaviour.Push0) {
-					// Nothing
-				} else if (opcode.StackBehaviourPush == StackBehaviour.Push1) {
-					SetStackType (type);
-				} else if (opcode.StackBehaviourPush == StackBehaviour.Pushi) {
-					SetStackType (ReferenceContainer.MakeType (Module, type));
-				} else {
-					throw new NotImplementedException (opcode.Name);
-				}
-			}
 		}
 
 		public void Emit (OpCode opcode, string arg)
 		{
 			ig.Emit (opcode, arg);
-
-			if (TrackStackTypes) {
-				SetStackType (Module.Compiler.BuiltinTypes.String);
-			}
 		}
 
 		public void Emit (OpCode opcode, double arg)
 		{
 			ig.Emit (opcode, arg);
-
-			if (TrackStackTypes) {
-				SetStackType (Module.Compiler.BuiltinTypes.Double);
-			}
 		}
 
 		public void Emit (OpCode opcode, float arg)
 		{
 			ig.Emit (opcode, arg);
-
-			if (TrackStackTypes) {
-				SetStackType (Module.Compiler.BuiltinTypes.Float);
-			}
 		}
 
 		public void Emit (OpCode opcode, Label label)
@@ -371,29 +331,6 @@ namespace Mono.CSharp
 				type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
 
 			ig.Emit (opcode, type.GetMetaInfo ());
-
-			if (TrackStackTypes) {
-				switch (opcode.StackBehaviourPush) {
-				case StackBehaviour.Push0:
-					// Nothing
-					break;
-				case StackBehaviour.Pushi:
-					SetStackType (ReferenceContainer.MakeType (Module, type));
-					break;
-				case StackBehaviour.Push1:
-					SetStackType (type);
-					break;
-				default:
-					if (opcode == OpCodes.Box) {
-						SetStackType (Module.Compiler.BuiltinTypes.Object);
-					} else if (opcode == OpCodes.Castclass) {
-						SetStackType (type);
-					} else {
-						throw new NotImplementedException (opcode.Name);
-					}
-					break;
-				}
-			}
 		}
 
 		public void Emit (OpCode opcode, FieldSpec field)
@@ -402,22 +339,6 @@ namespace Mono.CSharp
 				field = field.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 			ig.Emit (opcode, field.GetMetaInfo ());
-
-			if (TrackStackTypes) {
-				switch (opcode.StackBehaviourPush) {
-				case StackBehaviour.Push0:
-					// nothing
-					break;
-				case StackBehaviour.Push1:
-					SetStackType (field.MemberType);
-					break;
-				case StackBehaviour.Pushi:
-					SetStackType (ReferenceContainer.MakeType (Module, field.MemberType));
-					break;
-				default:
-					throw new NotImplementedException ();
-				}
-			}
 		}
 
 		public void Emit (OpCode opcode, MethodSpec method)
@@ -429,20 +350,6 @@ namespace Mono.CSharp
 				ig.Emit (opcode, (ConstructorInfo) method.GetMetaInfo ());
 			else
 				ig.Emit (opcode, (MethodInfo) method.GetMetaInfo ());
-
-			if (TrackStackTypes) {
-				//
-				// Don't bother with ldftn/Ldvirtftn they can never appear on open stack
-				//
-				if (method.IsConstructor) {
-					if (opcode == OpCodes.Newobj)
-						SetStackType (method.DeclaringType);
-				} else {
-					if (method.ReturnType.Kind != MemberKind.Void) {
-						SetStackType (method.ReturnType);
-					}
-				}
-			}
 		}
 
 		// TODO: REMOVE breaks mutator
@@ -471,10 +378,6 @@ namespace Mono.CSharp
 
 				ig.Emit (OpCodes.Newobj, ac.GetConstructor ());
 			}
-
-			if (TrackStackTypes) {
-				SetStackType (ac);
-			}
 		}
 
 		public void EmitArrayAddress (ArrayContainer ac)
@@ -484,20 +387,12 @@ namespace Mono.CSharp
 					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 				ig.Emit (OpCodes.Call, ac.GetAddressMethod ());
-
-				if (TrackStackTypes) {
-					SetStackType (ReferenceContainer.MakeType (Module, ac.Element));
-				}
 			} else {
 				var type = IsAnonymousStoreyMutateRequired ?
 					CurrentAnonymousMethod.Storey.Mutator.Mutate (ac.Element) :
 					ac.Element;
 
 				ig.Emit (OpCodes.Ldelema, type.GetMetaInfo ());
-
-				if (TrackStackTypes) {
-					SetStackType (ReferenceContainer.MakeType (Module, type));
-				}
 			}
 		}
 
@@ -511,11 +406,6 @@ namespace Mono.CSharp
 					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
 
 				ig.Emit (OpCodes.Call, ac.GetGetMethod ());
-
-				if (TrackStackTypes) {
-					SetStackType (ac.Element);
-				}
-
 				return;
 			}
 
@@ -581,10 +471,6 @@ namespace Mono.CSharp
 					break;
 				}
 				break;
-			}
-
-			if (TrackStackTypes) {
-				SetStackType (type);
 			}
 		}
 
@@ -652,10 +538,6 @@ namespace Mono.CSharp
 		public void EmitInt (int i)
 		{
 			EmitIntConstant (i);
-
-			if (TrackStackTypes) {
-				SetStackType (Module.Compiler.BuiltinTypes.Int);
-			}
 		}
 
 		void EmitIntConstant (int i)
@@ -721,10 +603,6 @@ namespace Mono.CSharp
 			} else {
 				ig.Emit (OpCodes.Ldc_I8, l);
 			}
-
-			if (TrackStackTypes) {
-				SetStackType (Module.Compiler.BuiltinTypes.Long);
-			}
 		}
 
 		//
@@ -787,20 +665,11 @@ namespace Mono.CSharp
 				}
 				break;
 			}
-
-			if (TrackStackTypes) {
-				// TODO: test for async when `this' can be used inside structs
-				SetStackType (type);
-			}
 		}
 
 		public void EmitNull ()
 		{
 			ig.Emit (OpCodes.Ldnull);
-
-			if (TrackStackTypes) {
-				SetStackType (Module.Compiler.BuiltinTypes.Object);
-			}
 		}
 
 		public void EmitArgumentAddress (int pos)
@@ -812,13 +681,6 @@ namespace Mono.CSharp
 				ig.Emit (OpCodes.Ldarga, pos);
 			else
 				ig.Emit (OpCodes.Ldarga_S, (byte) pos);
-
-			if (TrackStackTypes) {
-				//
-				// Should never be reached, all parameters are hoisted into class
-				//
-				throw new NotImplementedException ();
-			}
 		}
 
 		public void EmitArgumentLoad (int pos)
@@ -837,13 +699,6 @@ namespace Mono.CSharp
 				else
 					ig.Emit (OpCodes.Ldarg_S, (byte) pos);
 				break;
-			}
-
-			if (TrackStackTypes) {
-				//
-				// Should never be reached, all parameters are hoisted into class
-				//
-				throw new NotImplementedException ();
 			}
 		}
 
@@ -913,24 +768,6 @@ namespace Mono.CSharp
 		public void EmitThis ()
 		{
 			ig.Emit (OpCodes.Ldarg_0);
-
-			if (TrackStackTypes) {
-				//
-				// Using CurrentTypeOnStack as a placeholder for CurrentType to allow
-				// optimizations based on `this' presence
-				//
-				SetStackType (InternalType.CurrentTypeOnStack);
-			}
-		}
-
-		//
-		// Returns actual stack types when stack types tracing is enabled
-		//
-		public TypeSpec[] GetStackTypes ()
-		{
-			TypeSpec[] types = new TypeSpec[StackHeight];
-			Array.Copy (stack_types, types, types.Length);
-			return types;
 		}
 
 		/// <summary>
@@ -977,20 +814,6 @@ namespace Mono.CSharp
 			s.Push (b);
 		}
 
-		void SetStackType (TypeSpec type)
-		{
-			if (type == null)
-				throw new ArgumentNullException ("type");
-
-			if (stack_types == null) {
-				stack_types = new TypeSpec[8];
-			} else if (StackHeight > stack_types.Length) {
-				Array.Resize (ref stack_types, stack_types.Length * 2);
-			}
-
-			stack_types[StackHeight - 1] = type;
-		}
-
 		/// <summary>
 		///   ReturnValue creates on demand the LocalBuilder for the
 		///   return value from the function.  By default this is not
@@ -1007,13 +830,203 @@ namespace Mono.CSharp
 		{
 			if (return_value == null){
 				return_value = DeclareLocal (return_type, false);
-				if (!HasReturnLabel){
-					ReturnLabel = DefineLabel ();
-					HasReturnLabel = true;
-				}
 			}
 
 			return return_value;
+		}
+	}
+
+	struct CallEmitter
+	{
+		public Expression InstanceExpression;
+
+		//
+		// When set leaves an extra copy of all arguments on the stack
+		//
+		public bool DuplicateArguments;
+
+		//
+		// Does not emit InstanceExpression load when InstanceExpressionOnStack
+		// is set. Used by compound assignments.
+		//
+		public bool InstanceExpressionOnStack;
+
+		//
+		// Any of arguments contains await expression
+		//
+		public bool HasAwaitArguments;
+
+		//
+		// When dealing with await arguments the original arguments are converted
+		// into a new set with hoisted stack results
+		//
+		public Arguments EmittedArguments;
+
+		public void Emit (EmitContext ec, MethodSpec method, Arguments Arguments, Location loc)
+		{
+			// Speed up the check by not doing it on not allowed targets
+			if (method.ReturnType.Kind == MemberKind.Void && method.IsConditionallyExcluded (ec.Module.Compiler, loc))
+				return;
+
+			EmitPredefined (ec, method, Arguments);
+		}
+
+		public void EmitPredefined (EmitContext ec, MethodSpec method, Arguments Arguments)
+		{
+			Expression instance_copy = null;
+
+			if (!HasAwaitArguments && ec.HasSet (BuilderContext.Options.AsyncBody)) {
+				HasAwaitArguments = Arguments != null && Arguments.ContainsEmitWithAwait ();
+				if (HasAwaitArguments && InstanceExpressionOnStack) {
+					throw new NotSupportedException ();
+				}
+			}
+
+			OpCode call_op;
+			LocalTemporary lt = null;
+
+			if (method.IsStatic) {
+				call_op = OpCodes.Call;
+			} else {
+				if (IsVirtualCallRequired (InstanceExpression, method)) {
+					call_op = OpCodes.Callvirt;
+				} else {
+					call_op = OpCodes.Call;
+				}
+
+				if (HasAwaitArguments) {
+					instance_copy = InstanceExpression.EmitToField (ec);
+					if (Arguments == null)
+						EmitCallInstance (ec, instance_copy, method.DeclaringType, call_op);
+				} else if (!InstanceExpressionOnStack) {
+					var instance_on_stack_type = EmitCallInstance (ec, InstanceExpression, method.DeclaringType, call_op);
+
+					if (DuplicateArguments) {
+						ec.Emit (OpCodes.Dup);
+						if (Arguments != null && Arguments.Count != 0) {
+							lt = new LocalTemporary (instance_on_stack_type);
+							lt.Store (ec);
+							instance_copy = lt;
+						}
+					}
+				}
+			}
+
+			if (Arguments != null && !InstanceExpressionOnStack) {
+				EmittedArguments = Arguments.Emit (ec, DuplicateArguments, HasAwaitArguments);
+				if (EmittedArguments != null) {
+					if (instance_copy != null) {
+						EmitCallInstance (ec, instance_copy, method.DeclaringType, call_op);
+
+						if (lt != null)
+							lt.Release (ec);
+					}
+
+					EmittedArguments.Emit (ec);
+				}
+			}
+
+			if (call_op == OpCodes.Callvirt && (InstanceExpression.Type.IsGenericParameter || InstanceExpression.Type.IsStruct)) {
+				ec.Emit (OpCodes.Constrained, InstanceExpression.Type);
+			}
+
+			//
+			// Set instance expression to actual result expression. When it contains await it can be
+			// picked up by caller
+			//
+			InstanceExpression = instance_copy;
+
+			if (method.Parameters.HasArglist) {
+				var varargs_types = GetVarargsTypes (method, Arguments);
+				ec.Emit (call_op, method, varargs_types);
+				return;
+			}
+
+			//
+			// If you have:
+			// this.DoFoo ();
+			// and DoFoo is not virtual, you can omit the callvirt,
+			// because you don't need the null checking behavior.
+			//
+			ec.Emit (call_op, method);
+		}
+
+		static TypeSpec EmitCallInstance (EmitContext ec, Expression instance, TypeSpec declaringType, OpCode callOpcode)
+		{
+			var instance_type = instance.Type;
+
+			//
+			// Push the instance expression
+			//
+			if ((instance_type.IsStruct && (callOpcode == OpCodes.Callvirt || (callOpcode == OpCodes.Call && declaringType == instance_type))) ||
+				instance_type.IsGenericParameter || declaringType.IsNullableType) {
+				//
+				// If the expression implements IMemoryLocation, then
+				// we can optimize and use AddressOf on the
+				// return.
+				//
+				// If not we have to use some temporary storage for
+				// it.
+				var iml = instance as IMemoryLocation;
+				if (iml != null) {
+					iml.AddressOf (ec, AddressOp.Load);
+				} else {
+					LocalTemporary temp = new LocalTemporary (instance_type);
+					instance.Emit (ec);
+					temp.Store (ec);
+					temp.AddressOf (ec, AddressOp.Load);
+					temp.Release (ec);
+				}
+
+				return ReferenceContainer.MakeType (ec.Module, instance_type);
+			}
+
+			if (instance_type.IsEnum || instance_type.IsStruct) {
+				instance.Emit (ec);
+				ec.Emit (OpCodes.Box, instance_type);
+				return ec.BuiltinTypes.Object;
+			}
+
+			instance.Emit (ec);
+			return instance_type;
+		}
+
+		static MetaType[] GetVarargsTypes (MethodSpec method, Arguments arguments)
+		{
+			AParametersCollection pd = method.Parameters;
+
+			Argument a = arguments[pd.Count - 1];
+			Arglist list = (Arglist) a.Expr;
+
+			return list.ArgumentTypes;
+		}
+
+		//
+		// Used to decide whether call or callvirt is needed
+		//
+		static bool IsVirtualCallRequired (Expression instance, MethodSpec method)
+		{
+			//
+			// There are 2 scenarious where we emit callvirt
+			//
+			// Case 1: A method is virtual and it's not used to call base
+			// Case 2: A method instance expression can be null. In this casen callvirt ensures
+			// correct NRE exception when the method is called
+			//
+			var decl_type = method.DeclaringType;
+			if (decl_type.IsStruct || decl_type.IsEnum)
+				return false;
+
+			if (instance is BaseThis)
+				return false;
+
+			//
+			// It's non-virtual and will never be null
+			//
+			if (!method.IsVirtual && (instance is This || instance is New || instance is ArrayCreation || instance is DelegateCreation))
+				return false;
+
+			return true;
 		}
 	}
 }

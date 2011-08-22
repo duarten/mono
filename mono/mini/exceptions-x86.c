@@ -118,7 +118,7 @@ win32_handle_stack_overflow (EXCEPTION_POINTERS* ep, struct sigcontext *sctx)
 	DWORD page_size;
 	MonoDomain *domain = mono_domain_get ();
 	MonoJitInfo rji;
-	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+	MonoJitTlsData *jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 	MonoLMF *lmf = jit_tls->lmf;		
 	MonoContext initial_ctx;
 	MonoContext ctx;
@@ -932,7 +932,7 @@ mono_arch_ip_from_context (void *sigctx)
 static void
 handle_signal_exception (gpointer obj)
 {
-	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+	MonoJitTlsData *jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 	MonoContext ctx;
 	static void (*restore_context) (MonoContext *);
 
@@ -1027,7 +1027,7 @@ mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
 	 * signal is disabled, and we could run arbitrary code though the debugger. So
 	 * resume into the normal stack and do most work there if possible.
 	 */
-	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+	MonoJitTlsData *jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 
 	/* Pass the ctx parameter in TLS */
 	mono_arch_sigctx_to_monoctx (ctx, &jit_tls->ex_ctx);
@@ -1040,7 +1040,7 @@ mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
 	return TRUE;
 #elif defined (TARGET_WIN32)
 	MonoContext mctx;
-	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+	MonoJitTlsData *jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 	struct sigcontext *ctx = (struct sigcontext *)sigctx;
 
 	mono_arch_sigctx_to_monoctx (sigctx, &jit_tls->ex_ctx);
@@ -1070,7 +1070,7 @@ mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
 static void
 restore_soft_guard_pages (void)
 {
-	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+	MonoJitTlsData *jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 	if (jit_tls->stack_ovf_guard_base)
 		mono_mprotect (jit_tls->stack_ovf_guard_base, jit_tls->stack_ovf_guard_size, MONO_MMAP_NONE);
 }
@@ -1094,13 +1094,13 @@ prepare_for_guard_pages (MonoContext *mctx)
 }
 
 static void
-altstack_handle_and_restore (void *sigctx, gpointer obj, gboolean stack_ovf)
+altstack_handle_and_restore (MonoContext *ctx, gpointer obj, gboolean stack_ovf)
 {
 	void (*restore_context) (MonoContext *);
 	MonoContext mctx;
 
 	restore_context = mono_get_restore_context ();
-	mono_arch_sigctx_to_monoctx (sigctx, &mctx);
+	mctx = *ctx;
 
 	if (mono_debugger_handle_exception (&mctx, (MonoObject *)obj)) {
 		if (stack_ovf)
@@ -1149,7 +1149,7 @@ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean
 	 *   ctx arg
 	 *   return ip
 	 */
-	frame_size = sizeof (ucontext_t) + sizeof (gpointer) * 4;
+ 	frame_size = sizeof (MonoContext) + sizeof (gpointer) * 4;
 	frame_size += 15;
 	frame_size &= ~15;
 	sp = (gpointer)(UCONTEXT_REG_ESP (ctx) & ~15);
@@ -1161,8 +1161,7 @@ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean
 	sp [0] = sp + 4;
 	sp [1] = exc;
 	sp [2] = (gpointer)stack_ovf;
-	/* may need to adjust pointers in the new struct copy, depending on the OS */
-	memcpy (sp + 4, ctx, sizeof (ucontext_t));
+	mono_sigctx_to_monoctx (sigctx, (MonoContext*)(sp + 4));
 	/* at the return form the signal handler execution starts in altstack_handle_and_restore() */
 	UCONTEXT_REG_EIP (ctx) = (unsigned long)altstack_handle_and_restore;
 	UCONTEXT_REG_ESP (ctx) = (unsigned long)(sp - 1);

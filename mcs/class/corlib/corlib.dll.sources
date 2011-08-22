@@ -1147,6 +1147,7 @@ System.Security/SecurityFrame.cs
 System.Security/SecurityException.cs
 System.Security/SecurityManager.cs
 System.Security/SecurityManager_2_1.cs
+System.Security/SecurityManager_mobile.cs
 System.Security/SecurityRuleSet.cs
 System.Security/SecurityRulesAttribute.cs
 System.Security/SecuritySafeCriticalAttribute.cs
@@ -1545,12 +1546,13 @@ System/Predicate.cs
 System.Collections.Generic/Comparer.cs
 
 System.Threading.Tasks/TaskFactory.cs
+System.Threading.Tasks/TaskFactory_T.cs
 System.Threading.Tasks/TaskStatus.cs
 System.Threading.Tasks/TaskCreationOptions.cs
-System.Threading.Tasks/ThreadWorker.cs
 System.Threading.Tasks/SchedulerProxy.cs
-System.Threading.Tasks/Scheduler.cs
 System.Threading.Tasks/CyclicDeque.cs
+System.Threading.Tasks/IConcurrentDeque.cs
+System.Threading.Tasks/PopResult.cs
 System.Threading.Tasks/TaskScheduler.cs
 System.Threading.Tasks/TaskContinuationOptions.cs
 System.Threading.Tasks/TaskCanceledException.cs

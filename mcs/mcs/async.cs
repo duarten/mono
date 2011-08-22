@@ -1,4 +1,4 @@
-﻿//
+//
 // async.cs: Asynchronous functions
 //
 // Author:
@@ -7,11 +7,14 @@
 // Dual licensed under the terms of the MIT X11 or GNU GPL
 //
 // Copyright 2011 Novell, Inc.
+// Copyright 2011 Xamarin Inc.
 //
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Collections;
+
 #if STATIC
 using IKVM.Reflection.Emit;
 #else
@@ -43,18 +46,13 @@ namespace Mono.CSharp
 			throw new NotImplementedException ("ET");
 		}
 
+		public override bool ContainsEmitWithAwait ()
+		{
+			return true;
+		}
+
 		protected override Expression DoResolve (ResolveContext rc)
 		{
-			if (rc.HasSet (ResolveContext.Options.FinallyScope)) {
-				rc.Report.Error (1984, loc,
-					"The `await' operator cannot be used in the body of a finally clause");
-			}
-
-			if (rc.HasSet (ResolveContext.Options.CatchScope)) {
-				rc.Report.Error (1985, loc,
-					"The `await' operator cannot be used in the body of a catch clause");
-			}
-
 			if (rc.HasSet (ResolveContext.Options.LockScope)) {
 				rc.Report.Error (1996, loc,
 					"The `await' operator cannot be used in the body of a lock statement");
@@ -92,7 +90,13 @@ namespace Mono.CSharp
 			stmt.EmitPrologue (ec);
 			stmt.Emit (ec);
 		}
-
+		
+		public override Expression EmitToField (EmitContext ec)
+		{
+			stmt.EmitPrologue (ec);
+			return stmt.GetResultExpression (ec);
+		}
+		
 		public void EmitAssign (EmitContext ec, FieldExpr field)
 		{
 			stmt.EmitPrologue (ec);
@@ -126,11 +130,27 @@ namespace Mono.CSharp
 			}
 		}
 
+		sealed class GetResultInvocation : Invocation
+		{
+			public GetResultInvocation (MethodGroupExpr mge, Arguments arguments)
+				: base (null, arguments)
+			{
+				mg = mge;
+				type = mg.BestCandidateReturnType;
+			}
+
+			public override Expression EmitToField (EmitContext ec)
+			{
+				return this;
+			}
+		}
+
 		Field awaiter;
-		PropertyExpr is_completed;
+		PropertySpec is_completed;
 		MethodSpec on_completed;
 		MethodSpec get_result;
 		TypeSpec type;
+		TypeSpec result_type;
 
 		public AwaitStatement (Expression expr, Location loc)
 			: base (expr, loc)
@@ -138,6 +158,12 @@ namespace Mono.CSharp
 		}
 
 		#region Properties
+
+		bool IsDynamic {
+			get {
+				return is_completed == null;
+			}
+		}
 
 		public TypeSpec Type {
 			get {
@@ -147,7 +173,7 @@ namespace Mono.CSharp
 
 		public TypeSpec ResultType {
 			get {
-				return get_result.ReturnType;
+				return result_type;
 			}
 		}
 
@@ -155,16 +181,26 @@ namespace Mono.CSharp
 
 		protected override void DoEmit (EmitContext ec)
 		{
+			GetResultExpression (ec).Emit (ec);
+		}
+
+		public Expression GetResultExpression (EmitContext ec)
+		{
 			var fe_awaiter = new FieldExpr (awaiter, loc);
 			fe_awaiter.InstanceExpression = new CompilerGeneratedThis (ec.CurrentType, loc);
 
 			//
 			// result = awaiter.GetResult ();
 			//
-			var mg_result = MethodGroupExpr.CreatePredefined (get_result, fe_awaiter.Type, loc);
-			mg_result.InstanceExpression = fe_awaiter;
+			if (IsDynamic) {
+				var rc = new ResolveContext (ec.MemberContext);
+				return new Invocation (new MemberAccess (fe_awaiter, "GetResult"), new Arguments (0)).Resolve (rc);
+			} else {
+				var mg_result = MethodGroupExpr.CreatePredefined (get_result, fe_awaiter.Type, loc);
+				mg_result.InstanceExpression = fe_awaiter;
 
-			mg_result.EmitCall (ec, new Arguments (0));
+				return new GetResultInvocation (mg_result, new Arguments (0));
+			}
 		}
 
 		public void EmitPrologue (EmitContext ec)
@@ -179,39 +215,33 @@ namespace Mono.CSharp
 
 			Label skip_continuation = ec.DefineLabel ();
 
-			is_completed.InstanceExpression = fe_awaiter;
-			is_completed.EmitBranchable (ec, skip_continuation, true);
+			Expression completed_expr;
+			if (IsDynamic) {
+				var rc = new ResolveContext (ec.MemberContext);
+
+				Arguments dargs = new Arguments (1);
+				dargs.Add (new Argument (fe_awaiter));
+				completed_expr = new DynamicMemberBinder ("IsCompleted", dargs, loc).Resolve (rc);
+			} else {
+				var pe = PropertyExpr.CreatePredefined (is_completed, loc);
+				pe.InstanceExpression = fe_awaiter;
+				completed_expr = pe;
+			}
+
+			completed_expr.EmitBranchable (ec, skip_continuation, true);
 
 			base.DoEmit (ec);
 
-			FieldSpec[] stack_fields = null;
-			TypeSpec[] stack = null;
 			//
-			// Here is the clever bit. We know that await statement has to yield the control
-			// back but it can appear inside almost any expression. This means the stack can
-			// contain any depth of values and same values have to be present when the continuation
-			// handles control back.
+			// The stack has to be empty before calling await continuation. We handle this
+			// by lifting values which would be left on stack into class fields. The process
+			// is quite complicated and quite hard to test because any expression can possibly
+			// leave a value on the stack.
 			//
-			// For example: await a + await b
+			// Following assert fails when some of expression called before is missing EmitToField
+			// or parent expression fails to find await in children expressions
 			//
-			// In this case we fabricate a static stack forwarding method which moves the values
-			// from the stack to async storey fields. On re-entry point we restore exactly same
-			// stack using these fields.
-			//
-			// We fabricate a static method because we don't want to touch original stack and
-			// the instance method would require `this' as the first stack value on the stack
-			//
-			if (ec.StackHeight > 0) {
-				var async_storey = (AsyncTaskStorey) machine_initializer.Storey;
-
-				stack = ec.GetStackTypes ();
-				var method = async_storey.GetStackForwarder (stack, out stack_fields);
-				ec.EmitThis ();
-				ec.Emit (OpCodes.Call, method);
-			}
-
-			var mg_completed = MethodGroupExpr.CreatePredefined (on_completed, fe_awaiter.Type, loc);
-			mg_completed.InstanceExpression = fe_awaiter;
+			ec.AssertEmptyStack ();
 
 			var args = new Arguments (1);
 			var storey = (AsyncTaskStorey) machine_initializer.Storey;
@@ -220,35 +250,26 @@ namespace Mono.CSharp
 
 			args.Add (new Argument (fe_cont));
 
-			//
-			// awaiter.OnCompleted (continuation);
-			//
-			mg_completed.EmitCall (ec, args);
+			if (IsDynamic) {
+				var rc = new ResolveContext (ec.MemberContext);
+				var mg_expr = new Invocation (new MemberAccess (fe_awaiter, "OnCompleted"), args).Resolve (rc);
+
+				ExpressionStatement es = (ExpressionStatement) mg_expr;
+				es.EmitStatement (ec);
+			} else {
+				var mg_completed = MethodGroupExpr.CreatePredefined (on_completed, fe_awaiter.Type, loc);
+				mg_completed.InstanceExpression = fe_awaiter;
+
+				//
+				// awaiter.OnCompleted (continuation);
+				//
+				mg_completed.EmitCall (ec, args);
+			}
 
 			// Return ok
 			machine_initializer.EmitLeave (ec, unwind_protect);
 
 			ec.MarkLabel (resume_point);
-
-			if (stack_fields != null) {
-				for (int i = 0; i < stack_fields.Length; ++i) {
-					ec.EmitThis ();
-
-					var field = stack_fields[i];
-
-					//
-					// We don't store `this' because it can be easily re-created
-					//
-					if (field == null)
-						continue;
-
-					if (stack[i] is ReferenceContainer)
-						ec.Emit (OpCodes.Ldflda, field);
-					else
-						ec.Emit (OpCodes.Ldfld, field);
-				}
-			}
-
 			ec.MarkLabel (skip_continuation);
 		}
 
@@ -285,13 +306,21 @@ namespace Mono.CSharp
 			if (!base.Resolve (bc))
 				return false;
 
+			Arguments args = new Arguments (0);
+
 			type = expr.Type;
 
 			//
-			// The task result is of dynamic type
+			// The await expression is of dynamic type
 			//
-			if (expr.Type.BuiltinType == BuiltinTypeSpec.Type.Dynamic)
-				throw new NotImplementedException ("dynamic await");
+			if (type.BuiltinType == BuiltinTypeSpec.Type.Dynamic) {
+				result_type = type;
+
+				awaiter = ((AsyncTaskStorey) machine_initializer.Storey).AddAwaiter (type, loc);
+
+				expr = new Invocation (new MemberAccess (expr, "GetAwaiter"), args).Resolve (bc);
+				return true;
+			}
 
 			//
 			// Check whether the expression is awaitable
@@ -300,40 +329,28 @@ namespace Mono.CSharp
 			if (ama == null)
 				return false;
 
-			Arguments args = new Arguments (0);
-
 			var errors_printer = new SessionReportPrinter ();
 			var old = bc.Report.SetPrinter (errors_printer);
 			ama = new Invocation (ama, args).Resolve (bc);
+			bc.Report.SetPrinter (old);
 
 			if (errors_printer.ErrorsCount > 0 || !MemberAccess.IsValidDotExpression (ama.Type)) {
-				bc.Report.SetPrinter (old);
-				Error_WrongGetAwaiter (bc, loc, expr.Type);
+				Error_WrongGetAwaiter (bc, expr.Location, expr.Type);
 				return false;
 			}
 
 			var awaiter_type = ama.Type;
 			awaiter = ((AsyncTaskStorey) machine_initializer.Storey).AddAwaiter (awaiter_type, loc);
+
 			expr = ama;
 
 			//
 			// Predefined: bool IsCompleted { get; } 
 			//
-			var is_completed_ma = new MemberAccess (expr, "IsCompleted").Resolve (bc);
-			if (is_completed_ma != null) {
-				is_completed = is_completed_ma as PropertyExpr;
-				if (is_completed != null && is_completed.Type.BuiltinType == BuiltinTypeSpec.Type.Bool && is_completed.IsInstance && is_completed.Getter != null) {
-					// valid
-				} else {
-					bc.Report.SetPrinter (old);
-					Error_WrongAwaiterPattern (bc, awaiter_type);
-					return false;
-				}
-			}
+			is_completed = MemberCache.FindMember (awaiter_type, MemberFilter.Property ("IsCompleted", bc.Module.Compiler.BuiltinTypes.Bool),
+				BindingRestriction.InstanceOnly) as PropertySpec;
 
-			bc.Report.SetPrinter (old);
-
-			if (errors_printer.ErrorsCount > 0) {
+			if (is_completed == null || !is_completed.HasGet) {
 				Error_WrongAwaiterPattern (bc, awaiter_type);
 				return false;
 			}
@@ -365,6 +382,8 @@ namespace Mono.CSharp
 				Error_WrongAwaiterPattern (bc, awaiter_type);
 				return false;
 			}
+
+			result_type = get_result.ReturnType;
 
 			return true;
 		}
@@ -407,7 +426,7 @@ namespace Mono.CSharp
 
 		#endregion
 
-		public static void Create (ParametersBlock block, ParametersCompiled parameters, TypeContainer host, TypeSpec returnType, Location loc)
+		public static void Create (IMemberContext context, ParametersBlock block, ParametersCompiled parameters, TypeContainer host, TypeSpec returnType, Location loc)
 		{
 			if (returnType != null && returnType.Kind != MemberKind.Void &&
 				returnType != host.Module.PredefinedTypes.Task.TypeSpec &&
@@ -439,11 +458,12 @@ namespace Mono.CSharp
 				}
 			}
 
-			// TODO: Warning
-			//if (!block.HasAwait) {
-			//}
+			if (!block.IsAsync) {
+				host.Compiler.Report.Warning (1998, 1, loc,
+					"Async block lacks `await' operator and will run synchronously");
+			}
 
-			block.WrapIntoAsyncTask (host, returnType);
+			block.WrapIntoAsyncTask (context, host, returnType);
 		}
 
 		protected override BlockContext CreateBlockContext (ResolveContext rc)
@@ -453,6 +473,7 @@ namespace Mono.CSharp
 			if (lambda != null)
 				return_inference = lambda.ReturnTypeInference;
 
+			ctx.StartFlowBranching (this, rc.CurrentBranching);
 			return ctx;
 		}
 
@@ -476,17 +497,31 @@ namespace Mono.CSharp
 		{
 			var storey = (AsyncTaskStorey) Storey;
 			storey.Instance.Emit (ec);
-			ec.Emit (OpCodes.Call, storey.StateMachineMethod.Spec);
 
+			var move_next_entry = storey.StateMachineMethod.Spec;
+			if (storey.MemberName.Arity > 0) {
+				move_next_entry = MemberCache.GetMember (storey.Instance.Type, move_next_entry);
+			}
+
+			ec.Emit (OpCodes.Call, move_next_entry);
+
+			//
+			// Emits return <async-storey-instance>.$builder.Task;
+			//
 			if (storey.Task != null) {
-				//
-				// async.$builder.Task;
-				//
+				var builder_field = storey.Builder.Spec;
+				var task_get = storey.Task.Get;
+
+				if (storey.MemberName.Arity > 0) {
+					builder_field = MemberCache.GetMember (storey.Instance.Type, builder_field);
+					task_get = MemberCache.GetMember (builder_field.MemberType, task_get);
+				}
+
 				var pe_task = new PropertyExpr (storey.Task, loc) {
-					InstanceExpression = new FieldExpr (storey.Builder, loc) {
+					InstanceExpression = new FieldExpr (builder_field, loc) {
 						InstanceExpression = storey.Instance
 					},
-					Getter = storey.Task.Get
+					Getter = task_get
 				};
 
 				pe_task.Emit (ec);
@@ -502,11 +537,13 @@ namespace Mono.CSharp
 		{
 			readonly FieldSpec[] fields;
 			readonly TypeSpec[] parametersTypes;
+			readonly int thisParameterIndex;
 
-			public ParametersLoadStatement (FieldSpec[] fields, TypeSpec[] parametersTypes)
+			public ParametersLoadStatement (FieldSpec[] fields, TypeSpec[] parametersTypes, int thisParameterIndex)
 			{
 				this.fields = fields;
 				this.parametersTypes = parametersTypes;
+				this.thisParameterIndex = thisParameterIndex;
 			}
 
 			protected override void CloneTo (CloneContext clonectx, Statement target)
@@ -521,7 +558,7 @@ namespace Mono.CSharp
 					if (field == null)
 						continue;
 
-					ec.EmitArgumentLoad (fields.Length);
+					ec.EmitArgumentLoad (thisParameterIndex);
 					ec.EmitArgumentLoad (i);
 					if (parametersTypes[i] is ReferenceContainer)
 						ec.EmitLoadFromPtr (field.MemberType);
@@ -535,13 +572,13 @@ namespace Mono.CSharp
 		Field builder, continuation;
 		readonly TypeSpec return_type;
 		MethodSpec set_result;
+		MethodSpec set_exception;
 		PropertySpec task;
 		LocalVariable hoisted_return;
-		Dictionary<TypeSpec[], Tuple<MethodSpec, FieldSpec[]>> stack_forwarders;
-		int captured_stack_fields_count;
+		int locals_captured;
 
-		public AsyncTaskStorey (AsyncInitializer initializer, TypeSpec type)
-			: base (initializer.OriginalBlock, initializer.Host, null, null, "async")
+		public AsyncTaskStorey (IMemberContext context, AsyncInitializer initializer, TypeSpec type)
+			: base (initializer.OriginalBlock, initializer.Host,context.CurrentMemberDefinition as MemberBase, context.CurrentTypeParameters, "async")
 		{
 			return_type = type;
 		}
@@ -582,28 +619,32 @@ namespace Mono.CSharp
 
 		public Field AddAwaiter (TypeSpec type, Location loc)
 		{
-			return AddCompilerGeneratedField ("$awaiter" + awaiters++.ToString ("X"), new TypeExpression (type, loc));
+			return AddCompilerGeneratedField ("$awaiter" + awaiters++.ToString ("X"), new TypeExpression (type, loc), true);
 		}
 
-		FieldSpec CreateStackValueField (TypeSpec type)
+		public Field AddCapturedLocalVariable (TypeSpec type)
 		{
-			var field = AddCompilerGeneratedField ("<s>$" + captured_stack_fields_count++.ToString ("X"), new TypeExpression (type, Location));
+			if (mutator != null)
+				type = mutator.Mutate (type);
+
+			var field = AddCompilerGeneratedField ("<s>$" + locals_captured++.ToString ("X"), new TypeExpression (type, Location), true);
 			field.Define ();
 
-			return field.Spec;
+			return field;
 		}
 
 		protected override bool DoDefineMembers ()
 		{
 			var action = Module.PredefinedTypes.Action.Resolve ();
 			if (action != null) {
-				continuation = AddCompilerGeneratedField ("$continuation", new TypeExpression (action, Location));
+				continuation = AddCompilerGeneratedField ("$continuation", new TypeExpression (action, Location), true);
 				continuation.ModFlags |= Modifiers.READONLY;
 			}
 
 			PredefinedType builder_type;
 			PredefinedMember<MethodSpec> bf;
 			PredefinedMember<MethodSpec> sr;
+			PredefinedMember<MethodSpec> se;
 			bool has_task_return_type = false;
 			var pred_members = Module.PredefinedMembers;
 
@@ -611,32 +652,41 @@ namespace Mono.CSharp
 				builder_type = Module.PredefinedTypes.AsyncVoidMethodBuilder;
 				bf = pred_members.AsyncVoidMethodBuilderCreate;
 				sr = pred_members.AsyncVoidMethodBuilderSetResult;
+				se = pred_members.AsyncVoidMethodBuilderSetException;
 			} else if (return_type == Module.PredefinedTypes.Task.TypeSpec) {
 				builder_type = Module.PredefinedTypes.AsyncTaskMethodBuilder;
 				bf = pred_members.AsyncTaskMethodBuilderCreate;
 				sr = pred_members.AsyncTaskMethodBuilderSetResult;
+				se = pred_members.AsyncTaskMethodBuilderSetException;
 				task = pred_members.AsyncTaskMethodBuilderTask.Resolve (Location);
 			} else {
 				builder_type = Module.PredefinedTypes.AsyncTaskMethodBuilderGeneric;
 				bf = pred_members.AsyncTaskMethodBuilderGenericCreate;
 				sr = pred_members.AsyncTaskMethodBuilderGenericSetResult;
+				se = pred_members.AsyncTaskMethodBuilderGenericSetException;
 				task = pred_members.AsyncTaskMethodBuilderGenericTask.Resolve (Location);
 				has_task_return_type = true;
 			}
 
 			set_result = sr.Resolve (Location);
+			set_exception = se.Resolve (Location);
 			var builder_factory = bf.Resolve (Location);
 			var bt = builder_type.Resolve ();
-			if (bt == null || set_result == null || builder_factory == null)
+			if (bt == null || set_result == null || builder_factory == null || set_exception == null)
 				return false;
 
 			//
 			// Inflate generic Task types
 			//
 			if (has_task_return_type) {
-				bt = bt.MakeGenericType (Module, return_type.TypeArguments);
+				var task_return_type = return_type.TypeArguments;
+				if (mutator != null)
+					task_return_type = mutator.Mutate (task_return_type);
+
+				bt = bt.MakeGenericType (Module, task_return_type);
 				builder_factory = MemberCache.GetMember<MethodSpec> (bt, builder_factory);
 				set_result = MemberCache.GetMember<MethodSpec> (bt, set_result);
+				set_exception = MemberCache.GetMember<MethodSpec> (bt, set_exception);
 
 				if (task != null)
 					task = MemberCache.GetMember<PropertySpec> (bt, task);
@@ -681,6 +731,22 @@ namespace Mono.CSharp
 			return true;
 		}
 
+		public void EmitSetException (EmitContext ec, LocalVariableReference exceptionVariable)
+		{
+			//
+			// $builder.SetException (Exception)
+			//
+			var mg = MethodGroupExpr.CreatePredefined (set_exception, set_exception.DeclaringType, Location);
+			mg.InstanceExpression = new FieldExpr (Builder, Location) {
+				InstanceExpression = new CompilerGeneratedThis (ec.CurrentType, Location)
+			};
+
+			Arguments args = new Arguments (1);
+			args.Add (new Argument (exceptionVariable));
+
+			mg.EmitCall (ec, args);
+		}
+
 		public void EmitSetResult (EmitContext ec)
 		{
 			//
@@ -701,73 +767,6 @@ namespace Mono.CSharp
 			}
 
 			mg.EmitCall (ec, args);
-		}
-
-		//
-		// Fabricates stack forwarder based on stack types which copies all
-		// parameters to type fields
-		//
-		public MethodSpec GetStackForwarder (TypeSpec[] types, out FieldSpec[] fields)
-		{
-			if (stack_forwarders == null) {
-				stack_forwarders = new Dictionary<TypeSpec[], Tuple<MethodSpec, FieldSpec[]>> (TypeSpecComparer.Default);
-			} else {
-				//
-				// Does same forwarder method with same types already exist
-				//
-				Tuple<MethodSpec, FieldSpec[]> method;
-				if (stack_forwarders.TryGetValue (types, out method)) {
-					fields = method.Item2;
-					return method.Item1;
-				}
-			}
-
-			Parameter[] p = new Parameter[types.Length + 1];
-			TypeSpec[] ptypes = new TypeSpec[p.Length];
-			fields = new FieldSpec[types.Length];
-
-			for (int i = 0; i < types.Length; ++i) {
-				var t = types[i];
-
-				TypeSpec parameter_type = t;
-				if (parameter_type == InternalType.CurrentTypeOnStack) {
-					parameter_type = CurrentType;
-				}
-
-				p[i] = new Parameter (new TypeExpression (parameter_type, Location), null, 0, null, Location);
-				ptypes[i] = parameter_type;
-
-				if (t == InternalType.CurrentTypeOnStack) {
-					// Null means the type is `this' we can optimize by ignoring
-					continue;
-				}
-
-				var reference = t as ReferenceContainer;
-				if (reference != null)
-					t = reference.Element;
-
-				fields[i] = CreateStackValueField (t);
-			}
-
-			var this_parameter = new Parameter (new TypeExpression (CurrentType, Location), null, 0, null, Location);
-			p[types.Length] = this_parameter;
-			ptypes[types.Length] = CurrentType;
-
-			var parameters = ParametersCompiled.CreateFullyResolved (p, ptypes);
-
-			var m = new Method (this, null, new TypeExpression (Compiler.BuiltinTypes.Void, Location),
-				Modifiers.STATIC | Modifiers.PRIVATE | Modifiers.COMPILER_GENERATED | Modifiers.DEBUGGER_HIDDEN,
-				new MemberName ("<>s__" + stack_forwarders.Count.ToString ("X")), parameters, null);
-
-			m.Block = new ToplevelBlock (Compiler, parameters, Location);
-			m.Block.AddScopeStatement (new ParametersLoadStatement (fields, ptypes));
-
-			m.Define ();
-			Methods.Add (m);
-
-			stack_forwarders.Add (types, Tuple.Create (m.Spec, fields));
-
-			return m.Spec;
 		}
 	}
 }

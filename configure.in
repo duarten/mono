@@ -98,8 +98,18 @@ case "$host" in
 			if test "x$host" == "x$build"; then
 				AC_DEFINE(TARGET_WIN32,1,[Target OS is Win32])
 			fi
-			CC="gcc -mno-cygwin -g"
-			CXX="g++ -mno-cygwin -g"
+			#
+			# gcc-3/g++-3 are from the gcc-core/gcc-g++ cygwin packages.
+			# Other gcc packages will not work:
+			# - the gcc-4 packages no longer support -mno-cygwin
+			# - the mingw-gcc packages produce executables which depends on a libgcc<...>
+			# dll, which means we would have to distribute that file too.
+			#
+			if test "x$CC" != "x"; then
+				AC_ERROR(Don't set CC. mono can only be compiled with gcc-3 from the 'gcc-core' package)
+			fi
+			CC="gcc-3.exe -mno-cygwin -g"
+			CXX="g++-3.exe -mno-cygwin -g"
 			# So libgc configure gets -mno-cygwin
 			export CC
 			export CXX
@@ -363,12 +373,6 @@ if test "x$CXX" = "xg++"; then
 		# are inside automake conditionals
 		AC_MSG_ERROR([You need to install g++])
 	fi
-fi
-
-AC_CHECK_PROG(BISON, bison,yes,no)
-if test "x$BISON" = "xno";
-then
-	AC_MSG_ERROR([You need to install bison])
 fi
 
 dnl may require a specific autoconf version
@@ -711,7 +715,7 @@ DISABLED_FEATURES=none
 
 AC_ARG_ENABLE(minimal, [  --enable-minimal=LIST      drop support for LIST subsystems.
      LIST is a comma-separated list from: aot, profiler, decimal, pinvoke, debug,
-     reflection_emit, reflection_emit_save, large_code, logging, com, ssa, generics, attach, jit, simd, soft_debug, normalization, assembly_remapping.],
+     reflection_emit, reflection_emit_save, large_code, logging, com, ssa, generics, attach, jit, simd, soft_debug, normalization, assembly_remapping, shared_perfcounters.],
 [
 	for feature in `echo "$enable_minimal" | sed -e "s/,/ /g"`; do
 		eval "mono_feature_disable_$feature='yes'"
@@ -834,6 +838,11 @@ fi
 if test "x$mono_feature_disable_assembly_remapping" = "xyes"; then
 	AC_DEFINE(DISABLE_ASSEMBLY_REMAPPING, 1, [Disable assembly remapping.])
 	AC_MSG_NOTICE([Disabled Assembly remapping.])
+fi
+
+if test "x$mono_feature_disable_shared_perfcounters" = "xyes"; then
+	AC_DEFINE(DISABLE_SHARED_PERFCOUNTERS, 1, [Disable shared perfcounters.])
+	AC_MSG_NOTICE([Disabled Shared perfcounters.])
 fi
 
 AC_MSG_CHECKING(for visibility __attribute__)
@@ -1368,6 +1377,7 @@ if test x$target_win32 = xno; then
 	AC_CHECK_HEADERS(pthread.h)
 	AC_CHECK_FUNCS(pthread_mutex_timedlock)
 	AC_CHECK_FUNCS(pthread_getattr_np pthread_attr_get_np)
+	AC_CHECK_FUNCS(pthread_kill)
 	AC_MSG_CHECKING(for PTHREAD_MUTEX_RECURSIVE)
 	AC_TRY_COMPILE([ #include <pthread.h>], [
 		pthread_mutexattr_t attr;
@@ -1468,7 +1478,11 @@ if test x$target_win32 = xno; then
 			child ()
 			{
 				struct sigaction sa;
+			#ifdef __APPLE__
+				stack_t sas;
+			#else
 				struct sigaltstack sas;
+			#endif
 				pthread_t id;
 				pthread_attr_t attr;
 
@@ -1480,6 +1494,11 @@ if test x$target_win32 = xno; then
 					return;
 				}
 
+				/* x86 darwin deliver segfaults using SIGBUS */
+				if (sigaction (SIGBUS, &sa, NULL) == -1) {
+					perror ("sigaction");
+					return;
+				}
 				sas.ss_sp = malloc (SIGSTKSZ);
 				sas.ss_size = SIGSTKSZ;
 				sas.ss_flags = 0;
@@ -2385,6 +2404,12 @@ if test "x$host" != "x$target"; then
 		AC_DEFINE(TARGET_AMD64, 1, [...])
 		AC_DEFINE(__mono_ilp32__, 1, [64 bit mode with 4 byte longs and pointers])
 		sizeof_register=8
+		;;
+   *-*-nacl)
+		TARGET=X86
+		arch_target=x86
+		AC_DEFINE(TARGET_X86, 1, [...])
+		sizeof_register=4
 		;;
    armv7l-unknown-linux-gnueabi*)
 		# TEGRA

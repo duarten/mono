@@ -5,6 +5,7 @@
 //	Marek Safar  <marek.safar@gmail.com>
 //
 // Copyright (C) 2011 Novell, Inc (http://www.novell.com)
+// Copyright (C) 2011 Xamarin, Inc (http://www.xamarin.com)
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -26,23 +27,44 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 
+using System.Threading;
+
 namespace System.Runtime.CompilerServices
 {
 	public struct AsyncVoidMethodBuilder
 	{
+		static readonly SynchronizationContext null_context = new SynchronizationContext ();
+
+		readonly SynchronizationContext context;
+
+		private AsyncVoidMethodBuilder (SynchronizationContext context)
+		{
+			this.context = context;
+		}
+
 		public static AsyncVoidMethodBuilder Create ()
 		{
-			return new AsyncVoidMethodBuilder ();
+			var ctx = SynchronizationContext.Current ?? null_context;
+			ctx.OperationStarted ();
+
+			return new AsyncVoidMethodBuilder (ctx);
 		}
 
 		public void SetException (Exception exception)
 		{
 			if (exception == null)
 				throw new ArgumentNullException ("exception");
+
+			try {
+				context.Post (l => { throw (Exception) l; }, exception);
+			} finally {
+				SetResult ();
+			}
 		}
 
 		public void SetResult ()
 		{
+			context.OperationCompleted ();
 		}
 	}
 }

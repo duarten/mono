@@ -102,10 +102,10 @@ struct _SgenThreadInfo {
 	MonoThreadInfo info;
 #if defined(__MACH__)
 	thread_port_t mach_port;
-#endif
-	
-	unsigned int stop_count; /* to catch duplicate signals */
+#else
 	int signal;
+	unsigned int stop_count; /* to catch duplicate signals */
+#endif
 	int skip;
 	volatile int in_critical_region;
 	gboolean doing_handshake;
@@ -227,13 +227,6 @@ struct _GCMemSection {
 
 typedef struct _SgenPinnedChunk SgenPinnedChunk;
 
-#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__)
-const static int suspend_signal_num = SIGXFSZ;
-#else
-const static int suspend_signal_num = SIGPWR;
-#endif
-const static int restart_signal_num = SIGXCPU;
-
 /*
  * Recursion is not allowed for the thread lock.
  */
@@ -255,8 +248,6 @@ const static int restart_signal_num = SIGXCPU;
 		} while (InterlockedCompareExchange (&(x), __old_x + (i), __old_x) != __old_x); \
 	} while (0)
 
-/* non-pthread will need to provide their own version of start/stop */
-#define USE_SIGNAL_BASED_START_STOP_WORLD 1
 /* we intercept pthread_create calls to know which threads exist */
 #define USE_PTHREAD_INTERCEPT 1
 
@@ -277,6 +268,8 @@ extern int gc_debug_level;
 extern FILE* gc_debug_file;
 
 extern int current_collection_generation;
+
+extern unsigned int mono_sgen_global_stop_count;
 
 #define SGEN_ALLOC_ALIGN		8
 #define SGEN_ALLOC_ALIGN_BITS	3
@@ -610,12 +603,14 @@ void* mono_sgen_alloc_os_memory (size_t size, int activate) MONO_INTERNAL;
 void* mono_sgen_alloc_os_memory_aligned (mword size, mword alignment, gboolean activate) MONO_INTERNAL;
 void mono_sgen_free_os_memory (void *addr, size_t size) MONO_INTERNAL;
 
-int mono_sgen_thread_handshake (int signum) MONO_INTERNAL;
+int mono_sgen_thread_handshake (BOOL suspend) MONO_INTERNAL;
 gboolean mono_sgen_suspend_thread (SgenThreadInfo *info) MONO_INTERNAL;
 gboolean mono_sgen_resume_thread (SgenThreadInfo *info) MONO_INTERNAL;
-
-
 void mono_sgen_wait_for_suspend_ack (int count) MONO_INTERNAL;
+gboolean mono_sgen_park_current_thread_if_doing_handshake (SgenThreadInfo *p) MONO_INTERNAL;
+void mono_sgen_os_init (void) MONO_INTERNAL;
+
+void mono_sgen_fill_thread_info_for_suspend (SgenThreadInfo *info) MONO_INTERNAL;
 
 gboolean mono_sgen_is_worker_thread (pthread_t thread) MONO_INTERNAL;
 
@@ -635,11 +630,14 @@ enum {
 	INTERNAL_MEM_SCAN_STARTS,
 	INTERNAL_MEM_FIN_TABLE,
 	INTERNAL_MEM_FINALIZE_ENTRY,
+	INTERNAL_MEM_FINALIZE_READY_ENTRY,
 	INTERNAL_MEM_DISLINK_TABLE,
 	INTERNAL_MEM_DISLINK,
 	INTERNAL_MEM_ROOTS_TABLE,
 	INTERNAL_MEM_ROOT_RECORD,
 	INTERNAL_MEM_STATISTICS,
+	INTERNAL_MEM_STAT_PINNED_CLASS,
+	INTERNAL_MEM_STAT_REMSET_CLASS,
 	INTERNAL_MEM_REMSET,
 	INTERNAL_MEM_GRAY_QUEUE,
 	INTERNAL_MEM_STORE_REMSET,
@@ -703,6 +701,8 @@ void mono_sgen_find_section_pin_queue_start_end (GCMemSection *section) MONO_INT
 void mono_sgen_pin_objects_in_section (GCMemSection *section, SgenGrayQueue *queue) MONO_INTERNAL;
 
 void mono_sgen_pin_stats_register_object (char *obj, size_t size);
+void mono_sgen_pin_stats_register_global_remset (char *obj);
+void mono_sgen_pin_stats_print_class_stats (void);
 
 void mono_sgen_add_to_global_remset (gpointer ptr) MONO_INTERNAL;
 
@@ -805,7 +805,16 @@ mono_sgen_par_object_get_size (MonoVTable *vtable, MonoObject* o)
 	}
 }
 
-#define mono_sgen_safe_object_get_size(o)		mono_sgen_par_object_get_size ((MonoVTable*)SGEN_LOAD_VTABLE ((o)), (o))
+static inline guint
+mono_sgen_safe_object_get_size (MonoObject *obj)
+{
+       char *forwarded;
+
+       if ((forwarded = SGEN_OBJECT_IS_FORWARDED (obj)))
+               obj = (MonoObject*)forwarded;
+
+       return mono_sgen_par_object_get_size ((MonoVTable*)SGEN_LOAD_VTABLE (obj), obj);
+}
 
 const char* mono_sgen_safe_name (void* obj) MONO_INTERNAL;
 
@@ -866,7 +875,71 @@ void* mono_sgen_nursery_alloc (size_t size) MONO_INTERNAL;
 void* mono_sgen_nursery_alloc_range (size_t size, size_t min_size, int *out_alloc_size) MONO_INTERNAL;
 MonoVTable* mono_sgen_get_array_fill_vtable (void) MONO_INTERNAL;
 gboolean mono_sgen_can_alloc_size (size_t size) MONO_INTERNAL;
-void mono_sgen_nursery_retire_region (void *address, ssize_t size) MONO_INTERNAL;
+void mono_sgen_nursery_retire_region (void *address, ptrdiff_t size) MONO_INTERNAL;
+
+/* hash tables */
+
+typedef struct _SgenHashTableEntry SgenHashTableEntry;
+struct _SgenHashTableEntry {
+	SgenHashTableEntry *next;
+	gpointer key;
+	char data [MONO_ZERO_LEN_ARRAY]; /* data is pointer-aligned */
+};
+
+typedef struct {
+	int table_mem_type;
+	int entry_mem_type;
+	size_t data_size;
+	GHashFunc hash_func;
+	GEqualFunc equal_func;
+	SgenHashTableEntry **table;
+	guint size;
+	guint num_entries;
+} SgenHashTable;
+
+#define SGEN_HASH_TABLE_INIT(table_type,entry_type,data_size,hash_func,equal_func)	{ (table_type), (entry_type), (data_size), (hash_func), (equal_func), NULL, 0, 0 }
+#define SGEN_HASH_TABLE_ENTRY_SIZE(data_size)			((data_size) + sizeof (SgenHashTableEntry*) + sizeof (gpointer))
+
+gpointer mono_sgen_hash_table_lookup (SgenHashTable *table, gpointer key) MONO_INTERNAL;
+gboolean mono_sgen_hash_table_replace (SgenHashTable *table, gpointer key, gpointer data) MONO_INTERNAL;
+gboolean mono_sgen_hash_table_remove (SgenHashTable *table, gpointer key, gpointer data_return) MONO_INTERNAL;
+
+void mono_sgen_hash_table_clean (SgenHashTable *table) MONO_INTERNAL;
+
+#define mono_sgen_hash_table_num_entries(h)	((h)->num_entries)
+
+#define SGEN_HASH_TABLE_FOREACH(h,k,v) do {				\
+		SgenHashTable *__hash_table = (h);			\
+		SgenHashTableEntry **__table = __hash_table->table;	\
+		SgenHashTableEntry *__entry, *__prev;			\
+		guint __i;						\
+		for (__i = 0; __i < (h)->size; ++__i) {			\
+			__prev = NULL;					\
+			for (__entry = __table [__i]; __entry; ) {	\
+				(k) = __entry->key;			\
+				(v) = (gpointer)__entry->data;
+
+/* The loop must be continue'd after using this! */
+#define SGEN_HASH_TABLE_FOREACH_REMOVE(free)	do {			\
+		SgenHashTableEntry *__next = __entry->next;		\
+		if (__prev)						\
+			__prev->next = __next;				\
+		else							\
+			__table [__i] = __next;				\
+		if ((free))						\
+			mono_sgen_free_internal (__entry, __hash_table->entry_mem_type); \
+		__entry = __next;					\
+		--__hash_table->num_entries;				\
+	} while (0)
+
+#define SGEN_HASH_TABLE_FOREACH_SET_KEY(k)	((__entry)->key = (k))
+
+#define SGEN_HASH_TABLE_FOREACH_END					\
+				__prev = __entry;			\
+				__entry = __entry->next;		\
+			}						\
+		}							\
+	} while (0)
 
 #endif /* HAVE_SGEN_GC */
 

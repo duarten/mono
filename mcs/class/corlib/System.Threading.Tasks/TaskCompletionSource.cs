@@ -6,6 +6,7 @@
 //       Marek Safar <marek.safar@gmail.com>
 // 
 // Copyright (c) 2009 Jérémie "Garuma" Laval
+// Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -34,6 +35,7 @@ namespace System.Threading.Tasks
 	public class TaskCompletionSource<TResult>
 	{
 		readonly Task<TResult> source;
+		SpinLock opLock = new SpinLock (false);
 
 		public TaskCompletionSource ()
 		{
@@ -75,10 +77,7 @@ namespace System.Threading.Tasks
 		
 		public void SetException (IEnumerable<Exception> exceptions)
 		{
-			if (exceptions == null)
-				throw new ArgumentNullException ("exceptions");
-			
-			if (!ApplyOperation (() => source.HandleGenericException (new AggregateException (exceptions))))
+			if (!TrySetException (exceptions))
 				ThrowInvalidException ();
 		}
 		
@@ -110,8 +109,12 @@ namespace System.Threading.Tasks
 		{
 			if (exceptions == null)
 				throw new ArgumentNullException ("exceptions");
+
+			var aggregate = new AggregateException (exceptions);
+			if (aggregate.InnerExceptions.Count == 0)
+				throw new ArgumentNullException ("exceptions");
 			
-			return ApplyOperation (() => source.HandleGenericException (new AggregateException (exceptions)));
+			return ApplyOperation (() => source.HandleGenericException (aggregate));
 		}
 		
 		public bool TrySetResult (TResult result)
@@ -121,17 +124,24 @@ namespace System.Threading.Tasks
 				
 		bool ApplyOperation (Action action)
 		{
-			if (CheckInvalidState ())
-				return false;
+			bool taken = false;
+			try {
+				opLock.Enter (ref taken);
+				if (CheckInvalidState ())
+					return false;
 			
-			source.Status = TaskStatus.Running;
+				source.Status = TaskStatus.Running;
 
-			if (action != null)
-				action ();
+				if (action != null)
+					action ();
 
-			source.Finish ();
+				source.Finish ();
 			
-			return true;
+				return true;
+			} finally {
+				if (taken)
+					opLock.Exit ();
+			}
 		}
 		
 		bool CheckInvalidState ()

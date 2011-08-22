@@ -6,6 +6,7 @@
  *
  * Copyright 2001-2003 Ximian, Inc.
  * Copyright 2003-2008 Ximian, Inc.
+ * Copyright 2011 Xamarin, Inc (http://www.xamarin.com)
  *
  * See LICENSE for licensing information.
  */
@@ -168,7 +169,7 @@ SIG_HANDLER_SIGNATURE (mono_chain_signal)
 
 	GET_CONTEXT;
 
-	if (saved_handler) {
+	if (saved_handler && saved_handler->sa_handler) {
 		if (!(saved_handler->sa_flags & SA_SIGINFO)) {
 			saved_handler->sa_handler (signal);
 		} else {
@@ -301,7 +302,7 @@ SIG_HANDLER_SIGNATURE (sigprof_signal_handler)
 	if (call_chain_depth == 0) {
 		mono_profiler_stat_hit (mono_arch_ip_from_context (ctx), ctx);
 	} else {
-		MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+		MonoJitTlsData *jit_tls = mono_native_tls_get_value (mono_jit_tls_id);
 		int current_frame_index = 1;
 		MonoContext mono_context;
 		guchar *ips [call_chain_depth + 1];
@@ -422,7 +423,13 @@ add_signal_handler (int signo, gpointer handler)
 	sigemptyset (&sa.sa_mask);
 	sa.sa_flags = SA_SIGINFO;
 #ifdef MONO_ARCH_SIGSEGV_ON_ALTSTACK
+
+/*Apple likes to deliver SIGBUS for *0 */
+#ifdef __APPLE__
+	if (signo == SIGSEGV || signo == SIGBUS) {
+#else
 	if (signo == SIGSEGV) {
+#endif
 		sa.sa_flags |= SA_ONSTACK;
 
 		/* 
